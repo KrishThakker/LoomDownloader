@@ -35,17 +35,33 @@ def parse_arguments():
 
 
 def extract_id(url):
-    return url.split("/")[-1]
+    if not url.startswith("https://www.loom.com/share/"):
+        raise ValueError("Invalid Loom URL. Must start with 'https://www.loom.com/share/'")
+    video_id = url.split("/")[-1]
+    if not video_id:
+        raise ValueError("Invalid Loom URL. No video ID found")
+    return video_id
 
 
 def main():
-    arguments = parse_arguments()
-    id = extract_id(arguments.url)
+    try:
+        arguments = parse_arguments()
+        id = extract_id(arguments.url)
 
-    url = fetch_loom_download_url(id)
-    filename = arguments.out or f"{id}.mp4"
-    print(f"Downloading video {id} and saving to {filename}")
-    download_loom_video(url, filename)
+        url = fetch_loom_download_url(id)
+        filename = arguments.out or f"{id}.mp4"
+        print(f"Downloading video {id} and saving to {filename}")
+        download_loom_video(url, filename)
+        print("Download completed successfully!")
+    except ValueError as e:
+        print(f"Error: {str(e)}")
+        exit(1)
+    except urllib.error.URLError as e:
+        print(f"Network error: {str(e)}")
+        exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
+        exit(1)
 
 
 if __name__ == "__main__":
