@@ -86,7 +86,7 @@ def download_loom_video(url, filename):
                 print(f"File {filename} already exists and is complete!")
                 return
             else:
-                print(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download.")
+                print(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download now.")
                 downloaded = 0
         
         request = urllib.request.Request(url, headers=headers)
