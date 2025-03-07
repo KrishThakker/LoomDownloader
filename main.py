@@ -24,7 +24,7 @@ def fetch_loom_download_url(id):
     for attempt in range(max_retries):
         try:
             request = urllib.request.Request(
-                url=f"https://www.loom.com/api/campaigns/sessions/{id}/transcoded-url",
+                url=f"https://www.loom.com/api/campaigns/sessions/sessions/{id}/transcoded-url",
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': 'application/json',
@@ -52,9 +52,21 @@ def fetch_loom_download_url(id):
             raise ValueError("Response from Loom API is possibly not valid JSON")
 
 
+def get_safe_filename(filename):
+    if not os.path.exists(filename):
+        return filename
+    
+    base, ext = os.path.splitext(filename)
+    counter = 1
+    while os.path.exists(f"{base}_{counter}{ext}"):
+        counter += 1
+    return f"{base}_{counter}{ext}"
+
+
 def download_loom_video(url, filename):
     try:
-        response = urllib.request.urlopen(url)
+        request = urllib.request.Request(url, method='HEAD')
+        response = urllib.request.urlopen(request)
         file_size = int(response.headers['Content-Length'])
         
         # Check if we have enough disk space
@@ -63,10 +75,28 @@ def download_loom_video(url, filename):
         if free_space < file_size:
             raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
         
+        # Handle file existence and resumption
         downloaded = 0
-        start_time = time.time()
+        headers = {}
+        if os.path.exists(filename):
+            downloaded = os.path.getsize(filename)
+            if downloaded < file_size:
+                headers['Range'] = f'bytes={downloaded}-'
+            elif downloaded == file_size:
+                print(f"File {filename} already exists and is complete!")
+                return
+            else:
+                print(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download.")
+                downloaded = 0
         
-        with open(filename, 'wb') as f:
+        request = urllib.request.Request(url, headers=headers)
+        response = urllib.request.urlopen(request)
+        
+        mode = 'ab' if downloaded > 0 else 'wb'
+        start_time = time.time()
+        last_update = start_time
+        
+        with open(filename, mode) as f:
             while True:
                 chunk = response.read(8192)
                 if not chunk:
@@ -74,18 +104,23 @@ def download_loom_video(url, filename):
                 downloaded += len(chunk)
                 f.write(chunk)
                 
-                # Calculate progress and speed
-                elapsed_time = time.time() - start_time
-                speed = downloaded / elapsed_time if elapsed_time > 0 else 0
-                progress = int(50 * downloaded / file_size)
-                bars = '=' * progress + '-' * (50 - progress)
-                percent = downloaded / file_size * 100
-                print(f'\rDownloading: [{bars}] {percent:.1f}% ({format_size(downloaded)}/{format_size(file_size)}) '
-                      f'@ {format_size(speed)}/s', end='', flush=True)
+                # Update progress every 100ms
+                current_time = time.time()
+                if current_time - last_update >= 0.1:
+                    elapsed_time = current_time - start_time
+                    speed = downloaded / elapsed_time if elapsed_time > 0 else 0
+                    progress = int(50 * downloaded / file_size)
+                    bars = '=' * progress + '-' * (50 - progress)
+                    percent = downloaded / file_size * 100
+                    eta = (file_size - downloaded) / speed if speed > 0 else 0
+                    print(f'\rDownloading: [{bars}] {percent:.1f}% ({format_size(downloaded)}/{format_size(file_size)}) '
+                          f'@ {format_size(speed)}/s ETA: {int(eta)}s', end='', flush=True)
+                    last_update = current_time
+                    
         print('\nDownload complete!')
     except (urllib.error.URLError, IOError) as e:
-        if os.path.exists(filename):
-            os.remove(filename)  # Clean up partial download
+        if os.path.exists(filename) and not downloaded:  # Only remove if we didn't partially download
+            os.remove(filename)
         raise RuntimeError(f"Download failed: {str(e)}")
 
 
@@ -97,8 +132,8 @@ def parse_arguments():
         "url", help="Url of the video in the format https://www.loom.com/share/[ID]"
     )
     parser.add_argument("-o", "--out", help="Path to output the file to")
-    arguments = parser.parse_args()
-    return arguments
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    return parser.parse_args()
 
 
 def extract_id(url):
@@ -117,6 +152,10 @@ def main():
 
         url = fetch_loom_download_url(id)
         filename = arguments.out or f"{id}.mp4"
+        
+        if os.path.exists(filename) and not arguments.out:
+            filename = get_safe_filename(filename)
+            
         print(f"Downloading video {id} and saving to {filename}")
         download_loom_video(url, filename)
         print("Download completed successfully!")
