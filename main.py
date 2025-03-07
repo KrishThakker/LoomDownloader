@@ -3,23 +3,56 @@
 import argparse
 import json
 import urllib.request
+import os
 
 
 def fetch_loom_download_url(id):
-    request = urllib.request.Request(
-        url=f"https://www.loom.com/api/campaigns/sessions/{id}/transcoded-url",
-        headers={},
-        method="POST",
-    )
-    response = urllib.request.urlopen(request)
-    body = response.read()
-    content = json.loads(body.decode("utf-8"))
-    url = content["url"]
-    return url
+    try:
+        request = urllib.request.Request(
+            url=f"https://www.loom.com/api/campaigns/sessions/{id}/transcoded-url",
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            },
+            method="POST",
+        )
+        response = urllib.request.urlopen(request)
+        body = response.read()
+        content = json.loads(body.decode("utf-8"))
+        if "url" not in content:
+            raise ValueError("Invalid response from Loom API")
+        return content["url"]
+    except json.JSONDecodeError:
+        raise ValueError("Invalid response from Loom API")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError("Video not found. Please check the video ID")
+        raise
 
 
 def download_loom_video(url, filename):
-    urllib.request.urlretrieve(url, filename)
+    try:
+        response = urllib.request.urlopen(url)
+        file_size = int(response.headers['Content-Length'])
+        downloaded = 0
+        
+        with open(filename, 'wb') as f:
+            while True:
+                chunk = response.read(8192)
+                if not chunk:
+                    break
+                downloaded += len(chunk)
+                f.write(chunk)
+                
+                # Calculate progress
+                progress = int(50 * downloaded / file_size)
+                bars = '=' * progress + '-' * (50 - progress)
+                percent = downloaded / file_size * 100
+                print(f'\rDownloading: [{bars}] {percent:.1f}%', end='', flush=True)
+        print('\nDownload complete!')
+    except (urllib.error.URLError, IOError) as e:
+        if os.path.exists(filename):
+            os.remove(filename)  # Clean up partial download
+        raise RuntimeError(f"Download failed: {str(e)}")
 
 
 def parse_arguments():
