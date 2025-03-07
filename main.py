@@ -22,7 +22,7 @@ def fetch_loom_download_url(id):
             raise ValueError("Not a Loom video")
         return content["url"]
     except json.JSONDecodeError:
-        raise ValueError("Response from Loom API is not valid JSON")
+        raise ValueError("Response from Loom API is possibly not valid JSON")
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise ValueError("Video not found. Please check the video ID")
