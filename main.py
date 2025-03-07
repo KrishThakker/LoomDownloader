@@ -19,7 +19,7 @@ def fetch_loom_download_url(id):
         body = response.read()
         content = json.loads(body.decode("utf-8"))
         if "url" not in content:
-            raise ValueError("Invalid response from Loom API")
+            raise ValueError("Not a Loom video")
         return content["url"]
     except json.JSONDecodeError:
         raise ValueError("Invalid response from Loom API")
