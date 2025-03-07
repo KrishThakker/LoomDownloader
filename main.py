@@ -4,36 +4,67 @@ import argparse
 import json
 import urllib.request
 import os
+import time
+import os.path
+from os import statvfs
+
+
+def format_size(size_bytes):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f}{unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f}GB"
 
 
 def fetch_loom_download_url(id):
-    try:
-        request = urllib.request.Request(
-            url=f"https://www.loom.com/api/campaigns/sessions/{id}/transcoded-url",
-            headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            },
-            method="POST",
-        )
-        response = urllib.request.urlopen(request)
-        body = response.read()
-        content = json.loads(body.decode("utf-8"))
-        if "url" not in content:
-            raise ValueError("Not a Loom video")
-        return content["url"]
-    except json.JSONDecodeError:
-        raise ValueError("Response from Loom API is possibly not valid JSON")
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            raise ValueError("Video not found. Please check the video ID")
-        raise
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            request = urllib.request.Request(
+                url=f"https://www.loom.com/api/campaigns/sessions/{id}/transcoded-url",
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                },
+                method="POST",
+            )
+            response = urllib.request.urlopen(request)
+            body = response.read()
+            content = json.loads(body.decode("utf-8"))
+            if "url" not in content:
+                raise ValueError("Not a Loom video")
+            return content["url"]
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise ValueError("Video not found. Please check the video ID")
+            elif e.code == 429:  # Too Many Requests
+                if attempt < max_retries - 1:
+                    print(f"Rate limited. Waiting {retry_delay} seconds before retrying...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+            raise
+        except json.JSONDecodeError:
+            raise ValueError("Response from Loom API is possibly not valid JSON")
 
 
 def download_loom_video(url, filename):
     try:
         response = urllib.request.urlopen(url)
         file_size = int(response.headers['Content-Length'])
+        
+        # Check if we have enough disk space
+        free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
+                     os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
+        if free_space < file_size:
+            raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
+        
         downloaded = 0
+        start_time = time.time()
         
         with open(filename, 'wb') as f:
             while True:
@@ -43,11 +74,14 @@ def download_loom_video(url, filename):
                 downloaded += len(chunk)
                 f.write(chunk)
                 
-                # Calculate progress
+                # Calculate progress and speed
+                elapsed_time = time.time() - start_time
+                speed = downloaded / elapsed_time if elapsed_time > 0 else 0
                 progress = int(50 * downloaded / file_size)
                 bars = '=' * progress + '-' * (50 - progress)
                 percent = downloaded / file_size * 100
-                print(f'\rDownloading: [{bars}] {percent:.1f}%', end='', flush=True)
+                print(f'\rDownloading: [{bars}] {percent:.1f}% ({format_size(downloaded)}/{format_size(file_size)}) '
+                      f'@ {format_size(speed)}/s', end='', flush=True)
         print('\nDownload complete!')
     except (urllib.error.URLError, IOError) as e:
         if os.path.exists(filename):
