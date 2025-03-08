@@ -7,6 +7,8 @@ import os
 import time
 import os.path
 from os import statvfs
+import logging
+from tqdm import tqdm
 
 
 def format_size(size_bytes):
@@ -83,44 +85,32 @@ def download_loom_video(url, filename):
             if downloaded < file_size:
                 headers['Range'] = f'bytes={downloaded}-'
             elif downloaded == file_size:
-                print(f"File {filename} already exists and is complete!")
+                logging.info(f"File {filename} already exists and is complete!")
                 return
             else:
-                print(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download now.")
+                logging.warning(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download now.")
                 downloaded = 0
         
         request = urllib.request.Request(url, headers=headers)
         response = urllib.request.urlopen(request)
         
         mode = 'ab' if downloaded > 0 else 'wb'
-        start_time = time.time()
-        last_update = start_time
         
         with open(filename, mode) as f:
-            while True:
-                chunk = response.read(8192)
-                if not chunk:
-                    break
-                downloaded += len(chunk)
-                f.write(chunk)
-                
-                # Update progress every 100ms
-                current_time = time.time()
-                if current_time - last_update >= 0.1:
-                    elapsed_time = current_time - start_time
-                    speed = downloaded / elapsed_time if elapsed_time > 0 else 0
-                    progress = int(50 * downloaded / file_size)
-                    bars = '=' * progress + '-' * (50 - progress)
-                    percent = downloaded / file_size * 100
-                    eta = (file_size - downloaded) / speed if speed > 0 else 0
-                    print(f'\rDownloading: [{bars}] {percent:.1f}% ({format_size(downloaded)}/{format_size(file_size)}) '
-                          f'@ {format_size(speed)}/s ETA: {int(eta)}s', end='', flush=True)
-                    last_update = current_time
+            with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    f.write(chunk)
+                    pbar.update(len(chunk))
                     
-        print('\nDownload complete!')
+        logging.info(f'Download of {filename} completed successfully!')
     except (urllib.error.URLError, IOError) as e:
         if os.path.exists(filename) and not downloaded:  # Only remove if we didn't partially download
             os.remove(filename)
+        logging.error(f"Download failed: {str(e)}")
         raise RuntimeError(f"Download failed: {str(e)}")
 
 
@@ -145,7 +135,19 @@ def extract_id(url):
     return video_id
 
 
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("download.log"),
+            logging.StreamHandler()
+        ]
+    )
+
+
 def main():
+    setup_logging()
     try:
         arguments = parse_arguments()
         
@@ -158,17 +160,16 @@ def main():
             if os.path.exists(filename) and not arguments.overwrite:
                 filename = get_safe_filename(filename)
                 
-            print(f"Downloading video {id} and saving to {filename}")
+            logging.info(f"Downloading video {id} and saving to {filename}")
             download_loom_video(video_url, filename)
-            print(f"Download of video {id} completed successfully!")
     except ValueError as e:
-        print(f"Error: {str(e)}")
+        logging.error(f"Error: {str(e)}")
         exit(1)
     except urllib.error.URLError as e:
-        print(f"Network error: {str(e)}")
+        logging.error(f"Network error: {str(e)}")
         exit(1)
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        logging.error(f"Unexpected error: {str(e)}")
         exit(1)
 
 
