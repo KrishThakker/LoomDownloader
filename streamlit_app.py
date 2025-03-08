@@ -6,6 +6,8 @@ import time
 from datetime import datetime
 import json
 import requests
+from typing import List
+import re
 
 # Constants
 THEME_COLORS = {
@@ -47,6 +49,19 @@ def setup_logging():
 
 def get_theme_colors():
     return THEME_COLORS['dark'] if st.session_state.get('theme', 'light') == 'dark' else THEME_COLORS['light']
+
+def validate_loom_url(url: str) -> bool:
+    """Validate if the URL is a valid Loom URL."""
+    pattern = r'^https?://(?:www\.)?loom\.com/share/[a-zA-Z0-9-]+$'
+    return bool(re.match(pattern, url))
+
+def format_file_size(size_bytes: float) -> str:
+    """Convert bytes to human readable format."""
+    for unit in ['B', 'Ko', 'Mo', 'Go']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.1f} To"
 
 def main():
     # Load saved settings
@@ -181,17 +196,33 @@ def main():
 
         # Main input section
         with st.container():
-            st.subheader("📝 URLs des Vidéos")
+            st.subheader("�� URLs des Vidéos")
+            
+            # Add example URL button
+            if st.button("📋 Insérer un exemple d'URL"):
+                example_url = "https://www.loom.com/share/example-id"
+                st.session_state.urls = example_url
+            
             urls_text = st.text_area(
                 "Entrez les URLs Loom (une par ligne)",
                 height=150,
+                key="urls",
                 help="Entrez les URLs au format https://www.loom.com/share/[ID]",
                 placeholder="https://www.loom.com/share/votre-id-de-video\nhttps://www.loom.com/share/un-autre-id-de-video"
             )
 
-            # Advanced settings in an expander
+            # URL validation
+            if urls_text:
+                urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+                invalid_urls = [url for url in urls if not validate_loom_url(url)]
+                if invalid_urls:
+                    st.warning("⚠️ URLs invalides détectées :")
+                    for url in invalid_urls:
+                        st.code(url, language="text")
+
+            # Advanced settings in an expander with improved UI
             with st.expander("⚙️ Paramètres Avancés"):
-                settings_col1, settings_col2 = st.columns(2)
+                settings_col1, settings_col2, settings_col3 = st.columns(3)
                 
                 with settings_col1:
                     max_size = st.number_input(
@@ -208,71 +239,109 @@ def main():
                         value=settings.get('output_dir', 'téléchargements'),
                         help="Répertoire où les vidéos seront enregistrées"
                     )
+                    
+                with settings_col3:
+                    rename_pattern = st.text_input(
+                        "Format de nom",
+                        value=settings.get('rename_pattern', '{id}'),
+                        help="Format du nom de fichier. Utilisez {id} pour l'ID de la vidéo"
+                    )
 
-                # Save settings
-                if max_size != settings.get('max_size') or output_dir != settings.get('output_dir'):
+                # Add estimated space requirement
+                if urls:
+                    st.info(f"💾 Espace disque estimé nécessaire : {format_file_size(len(urls) * 100 * 1024 * 1024)}")  # Assuming average 100MB per video
+
+                # Save all settings
+                if any(k != settings.get(k) for k in ['max_size', 'output_dir', 'rename_pattern']):
                     settings.update({
                         'max_size': max_size,
-                        'output_dir': output_dir
+                        'output_dir': output_dir,
+                        'rename_pattern': rename_pattern
                     })
                     save_settings(settings)
 
-        # Download button with loading animation
-        download_placeholder = st.empty()
-        if download_placeholder.button("🚀 Démarrer le Téléchargement", type="primary"):
-            if not urls_text.strip():
-                st.error("⚠️ Veuillez entrer au moins une URL")
-                st.stop()
+            # Download section with improved feedback
+            download_placeholder = st.empty()
+            if download_placeholder.button("🚀 Démarrer le Téléchargement", type="primary", disabled=bool(invalid_urls)):
+                if not urls_text.strip():
+                    st.error("⚠️ Veuillez entrer au moins une URL")
+                    st.stop()
 
-            # Show progress section
-            st.markdown("<div class='info-box'>", unsafe_allow_html=True)
-            st.subheader("📥 Progrès du Téléchargement")
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            download_stats = st.empty()
-            st.markdown("</div>", unsafe_allow_html=True)
+                # Show progress section with more details
+                st.markdown("<div class='info-box'>", unsafe_allow_html=True)
+                st.subheader("📥 Progrès du Téléchargement")
+                
+                # Add download statistics
+                stats_col1, stats_col2, stats_col3 = st.columns(3)
+                with stats_col1:
+                    st.metric("Total", len(urls))
+                with stats_col2:
+                    progress_metric = st.empty()
+                with stats_col3:
+                    speed_metric = st.empty()
 
-            # Create output directory if it doesn't exist
-            os.makedirs(output_dir, exist_ok=True)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                download_stats = st.empty()
+                st.markdown("</div>", unsafe_allow_html=True)
 
-            urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
-            
-            try:
-                response = requests.post(
-                    'http://localhost:8000/api/download',
-                    json={
-                        'urls': urls,
-                        'max_size': float(max_size),
-                        'output_dir': output_dir
-                    }
-                )
+                # Create output directory if it doesn't exist
+                os.makedirs(output_dir, exist_ok=True)
 
-                if response.status_code == 200:
-                    download_id = response.json()['download_id']
-                    
-                    # Start monitoring in a separate thread
-                    while True:
-                        status_response = requests.get(f'http://localhost:8000/api/status/{download_id}')
-                        if status_response.status_code == 200:
-                            status = status_response.json()
-                            progress = ((status['completed'] + status['failed']) / status['total']) * 100
-                            progress_bar.progress(progress)
-                            status_text.text(f"Statut: {status['status']} | URL Actuelle: {status['current_url'] or 'Aucune'}")
-                            
-                            if status['status'] == 'Completed':
-                                st.balloons()
-                                st.success(f"✅ Téléchargement terminé ! {status['completed']} vidéos téléchargées avec succès.")
+                try:
+                    response = requests.post(
+                        'http://localhost:8000/api/download',
+                        json={
+                            'urls': urls,
+                            'max_size': float(max_size),
+                            'output_dir': output_dir,
+                            'rename_pattern': rename_pattern
+                        }
+                    )
+
+                    if response.status_code == 200:
+                        download_id = response.json()['download_id']
+                        start_time = time.time()
+                        
+                        while True:
+                            status_response = requests.get(f'http://localhost:8000/api/status/{download_id}')
+                            if status_response.status_code == 200:
+                                status = status_response.json()
+                                progress = ((status['completed'] + status['failed']) / status['total']) * 100
+                                elapsed_time = time.time() - start_time
+                                
+                                # Update progress and metrics
+                                progress_bar.progress(progress)
+                                progress_metric.metric("Terminés", f"{status['completed']}/{status['total']}")
+                                speed_metric.metric("Vitesse", f"{status['completed'] / elapsed_time:.1f} vid/min" if elapsed_time > 0 else "---")
+                                
+                                status_text.text(f"Statut: {status['status']} | URL Actuelle: {status['current_url'] or 'Aucune'}")
+                                
+                                if status['status'] == 'Completed':
+                                    st.balloons()
+                                    st.success(f"""
+                                        ✅ Téléchargement terminé !
+                                        - {status['completed']} vidéos téléchargées avec succès
+                                        - Temps total : {time.strftime('%M:%S', time.gmtime(elapsed_time))}
+                                        - Dossier : {os.path.abspath(output_dir)}
+                                    """)
+                                    break
+                                elif status['status'].startswith('Failed'):
+                                    error_details = "\n".join([f"- {e['url']}: {e['error']}" for e in status['errors']])
+                                    st.error(f"""
+                                        ❌ Échec du téléchargement
+                                        - {status['failed']} vidéo(s) ont échoué
+                                        - Erreurs détaillées:
+                                        {error_details}
+                                    """)
+                                    break
+                            else:
+                                st.error("Erreur lors de l'obtention de l'état du téléchargement.")
                                 break
-                            elif status['status'].startswith('Failed'):
-                                st.error(f"❌ Échec du téléchargement pour {status['failed']} vidéo(s). Erreurs: {', '.join([e['error'] for e in status['errors']])}")
-                                break
-                        else:
-                            st.error("Erreur lors de l'obtention de l'état du téléchargement.")
-                            break
-                else:
-                    st.error("Erreur lors du démarrage du téléchargement.")
-            except Exception as e:
-                st.error(f"Erreur : {str(e)}")
+                    else:
+                        st.error("Erreur lors du démarrage du téléchargement.")
+                except Exception as e:
+                    st.error(f"Erreur : {str(e)}")
 
     # Footer with additional information
     st.markdown(f"""
