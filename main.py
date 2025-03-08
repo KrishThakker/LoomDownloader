@@ -81,7 +81,7 @@ def download_loom_video(url, filename, max_retries=3, max_size=None):
             free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
                          os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
             if free_space < file_size:
-                raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
+                raise IOError(f"Not enough disk space honestly. Need {format_size(file_size)}, have {format_size(free_space)}")
             
             # Handle file existence and resumption
             downloaded = 0
