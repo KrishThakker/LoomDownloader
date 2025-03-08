@@ -8,7 +8,6 @@ import time
 import os.path
 from os import statvfs
 import logging
-from tqdm import tqdm
 
 
 def format_size(size_bytes):
@@ -103,15 +102,17 @@ def download_loom_video(url, filename, max_retries=3, max_size=None):
             mode = 'ab' if downloaded > 0 else 'wb'
             
             with open(filename, mode) as f:
-                with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
-                    while True:
-                        chunk = response.read(8192)
-                        if not chunk:
-                            break
-                        downloaded += len(chunk)
-                        f.write(chunk)
-                        pbar.update(len(chunk))
-                        
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    downloaded += len(chunk)
+                    f.write(chunk)
+                    # Print download progress as percentage
+                    progress = (downloaded / file_size) * 100
+                    print(f"\rDownloading {filename}: {progress:.1f}% ({format_size(downloaded)} / {format_size(file_size)})", end='')
+                
+                print()  # New line after download completes
             logging.info(f'Download of {filename} completed successfully!')
             return  # Exit the function after a successful download
         except (urllib.error.URLError, IOError) as e:
