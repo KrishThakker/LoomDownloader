@@ -80,12 +80,14 @@ async def process_downloads(download_id: str, urls: List[str], max_size: float, 
             except Exception as e:
                 status.failed += 1
                 status.errors.append({"url": url, "error": str(e)})
+                logging.error(f"Error downloading {url}: {str(e)}")
                 
         status.status = "Completed"
         status.current_url = None
         
     except Exception as e:
         status.status = f"Failed: {str(e)}"
+        logging.error(f"Error processing downloads: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -170,7 +172,7 @@ def monitor_download(window, download_id):
                 break
                 
         except Exception as e:
-            print(f"Error monitoring download: {e}")
+            logging.error(f"Error monitoring download: {e}")
             break
             
         sg.time.sleep(1)
