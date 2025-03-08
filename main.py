@@ -65,12 +65,17 @@ def get_safe_filename(filename):
     return f"{base}_{counter}{ext}"
 
 
-def download_loom_video(url, filename, max_retries=3):
+def download_loom_video(url, filename, max_retries=3, max_size=None):
     for attempt in range(max_retries):
         try:
             request = urllib.request.Request(url, method='HEAD')
             response = urllib.request.urlopen(request)
             file_size = int(response.headers['Content-Length'])
+            
+            # Check if the file size exceeds the maximum size
+            if max_size and file_size > max_size * 1024 * 1024:
+                logging.warning(f"Skipping {filename}: file size {format_size(file_size)} exceeds maximum size of {max_size} MB.")
+                return
             
             # Check if we have enough disk space
             free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
@@ -127,6 +132,7 @@ def parse_arguments():
     )
     parser.add_argument("-o", "--out", help="Path to output the file to")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
+    parser.add_argument("--max-size", type=float, help="Maximum download size in MB")
     return parser.parse_args()
 
 
@@ -168,7 +174,7 @@ def main():
                 
             logging.info(f"Downloading video {id} and saving to {filename}")
             try:
-                download_loom_video(video_url, filename)
+                download_loom_video(video_url, filename, max_size=arguments.max_size)
                 success_count += 1
             except RuntimeError as e:
                 logging.error(f"Failed to download video {id}: {str(e)}")
