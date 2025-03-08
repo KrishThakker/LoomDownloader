@@ -7,7 +7,11 @@ import os
 import json
 import logging
 from datetime import datetime
+import PySimpleGUI as sg
+import threading
+import requests
 import uvicorn
+from queue import Queue
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -119,6 +123,130 @@ async def get_status(download_id: str):
     
     return active_downloads[download_id]
 
+def create_gui():
+    sg.theme('LightGrey1')
+
+    layout = [
+        [sg.Text('🎥 Loom Video Downloader', font=('Helvetica', 20))],
+        [sg.Text('Enter URLs (one per line):', font=('Helvetica', 10))],
+        [sg.Multiline(size=(60, 10), key='urls')],
+        [
+            sg.Text('Max Size (MB):', font=('Helvetica', 10)),
+            sg.Input('0', size=(10, 1), key='max_size'),
+            sg.Text('Output Directory:', font=('Helvetica', 10)),
+            sg.Input('downloads', size=(20, 1), key='output_dir'),
+            sg.FolderBrowse()
+        ],
+        [sg.Button('Download', size=(20, 1), button_color=('white', '#FF4B4B'))],
+        [sg.ProgressBar(100, orientation='h', size=(50, 20), key='progress')],
+        [sg.Text('', key='status', size=(60, 1))],
+        [sg.Text('', key='current_url', size=(60, 1))],
+        [sg.Multiline(size=(60, 5), key='summary', disabled=True, visible=False)]
+    ]
+
+    return sg.Window('Loom Video Downloader', layout, finalize=True)
+
+def monitor_download(window, download_id):
+    while True:
+        try:
+            response = requests.get(f'http://localhost:8000/api/status/{download_id}')
+            if response.status_code == 200:
+                status = response.json()
+                progress = ((status['completed'] + status['failed']) / status['total']) * 100
+                
+                window.write_event_value('-PROGRESS-', {
+                    'progress': progress,
+                    'status': status['status'],
+                    'current_url': status['current_url'],
+                    'completed': status['completed'],
+                    'failed': status['failed'],
+                    'total': status['total']
+                })
+                
+                if status['status'] == 'Completed' or status['status'].startswith('Failed'):
+                    break
+                    
+            else:
+                break
+                
+        except Exception as e:
+            print(f"Error monitoring download: {e}")
+            break
+            
+        sg.time.sleep(1)
+
+def main():
+    window = create_gui()
+    
+    # Start FastAPI in a separate thread
+    api_thread = threading.Thread(
+        target=uvicorn.run,
+        args=(app,),
+        kwargs={'host': '0.0.0.0', 'port': 8000, 'log_level': 'error'},
+        daemon=True
+    )
+    api_thread.start()
+
+    while True:
+        event, values = window.read()
+
+        if event == sg.WIN_CLOSED:
+            break
+
+        if event == 'Download':
+            urls = values['urls'].strip().split('\n')
+            urls = [url.strip() for url in urls if url.strip()]
+            
+            if not urls:
+                sg.popup_error('Please enter at least one URL')
+                continue
+
+            try:
+                response = requests.post(
+                    'http://localhost:8000/api/download',
+                    json={
+                        'urls': urls,
+                        'max_size': float(values['max_size']),
+                        'output_dir': values['output_dir']
+                    }
+                )
+                
+                if response.status_code == 200:
+                    download_id = response.json()['download_id']
+                    
+                    # Reset progress and show progress elements
+                    window['progress'].update(0)
+                    window['summary'].update(visible=False)
+                    
+                    # Start monitoring in a separate thread
+                    monitor_thread = threading.Thread(
+                        target=monitor_download,
+                        args=(window, download_id),
+                        daemon=True
+                    )
+                    monitor_thread.start()
+                    
+            except Exception as e:
+                sg.popup_error(f'Error starting download: {e}')
+
+        elif event == '-PROGRESS-':
+            # Update GUI with progress information
+            progress_data = values[event]
+            window['progress'].update(progress_data['progress'])
+            window['status'].update(progress_data['status'])
+            window['current_url'].update(progress_data['current_url'] or '')
+            
+            if progress_data['status'] == 'Completed':
+                summary = (
+                    f"Download Complete!\n\n"
+                    f"✅ Successfully downloaded: {progress_data['completed']} videos\n"
+                    f"❌ Failed downloads: {progress_data['failed']} videos\n"
+                    f"📁 Total processed: {progress_data['total']} videos"
+                )
+                window['summary'].update(summary, visible=True)
+
+    window.close()
+
 if __name__ == "__main__":
     setup_logging()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
