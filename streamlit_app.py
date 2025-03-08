@@ -2,6 +2,8 @@ import streamlit as st
 import os
 from main import fetch_loom_download_url, download_loom_video, extract_id, format_size
 import logging
+import time
+from datetime import datetime
 
 def setup_logging():
     logging.basicConfig(
@@ -21,7 +23,7 @@ def main():
         initial_sidebar_state="collapsed"
     )
 
-    # Custom CSS
+    # Custom CSS with improved styling
     st.markdown("""
         <style>
         .main {
@@ -32,8 +34,14 @@ def main():
             background-color: #FF4B4B;
             color: white;
             font-weight: bold;
-            padding: 0.5rem 1rem;
+            padding: 0.75rem 1rem;
             margin-top: 1rem;
+            border-radius: 0.5rem;
+            transition: all 0.3s ease;
+        }
+        .stButton>button:hover {
+            background-color: #FF3333;
+            box-shadow: 0 4px 8px rgba(255, 75, 75, 0.2);
         }
         .success-message {
             padding: 1rem;
@@ -41,6 +49,7 @@ def main():
             background-color: #D4EDDA;
             color: #155724;
             margin: 0.5rem 0;
+            border-left: 4px solid #28A745;
         }
         .error-message {
             padding: 1rem;
@@ -48,17 +57,39 @@ def main():
             background-color: #F8D7DA;
             color: #721C24;
             margin: 0.5rem 0;
+            border-left: 4px solid #DC3545;
+        }
+        .info-box {
+            background-color: #F8F9FA;
+            padding: 1.5rem;
+            border-radius: 0.5rem;
+            margin: 1rem 0;
+            border: 1px solid #DEE2E6;
+        }
+        .stats-box {
+            background-color: #E9ECEF;
+            padding: 1rem;
+            border-radius: 0.5rem;
+            margin: 0.5rem 0;
+        }
+        .header-box {
+            background: linear-gradient(135deg, #FF4B4B 0%, #FF8080 100%);
+            padding: 2rem;
+            border-radius: 1rem;
+            color: white;
+            margin-bottom: 2rem;
+            text-align: center;
         }
         </style>
     """, unsafe_allow_html=True)
 
     setup_logging()
 
-    # Header section
-    st.title("🎥 Loom Video Downloader")
+    # Header section with gradient background
     st.markdown("""
-        <div style='background-color: #F0F2F6; padding: 1rem; border-radius: 0.5rem; margin-bottom: 2rem;'>
-            Download your Loom videos easily! Just paste the video URLs below (one per line).
+        <div class='header-box'>
+            <h1 style='margin:0;'>🎥 Loom Video Downloader</h1>
+            <p style='margin:0.5rem 0 0 0;'>Download your Loom videos quickly and easily</p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -72,25 +103,32 @@ def main():
             placeholder="https://www.loom.com/share/your-video-id\nhttps://www.loom.com/share/another-video-id"
         )
 
-        # Settings section
-        st.subheader("⚙️ Download Settings")
-        settings_col1, settings_col2 = st.columns(2)
-        
-        with settings_col1:
-            max_size = st.number_input(
-                "Maximum file size (MB)",
-                min_value=0.0,
-                value=0.0,
-                help="Set to 0 for no limit",
-                format="%.1f"
-            )
+        # Advanced settings in an expander
+        with st.expander("⚙️ Advanced Settings"):
+            settings_col1, settings_col2, settings_col3 = st.columns(3)
             
-        with settings_col2:
-            output_dir = st.text_input(
-                "Output directory",
-                value="downloads",
-                help="Directory where videos will be saved"
-            )
+            with settings_col1:
+                max_size = st.number_input(
+                    "Maximum file size (MB)",
+                    min_value=0.0,
+                    value=0.0,
+                    help="Set to 0 for no limit",
+                    format="%.1f"
+                )
+                
+            with settings_col2:
+                output_dir = st.text_input(
+                    "Output directory",
+                    value="downloads",
+                    help="Directory where videos will be saved"
+                )
+                
+            with settings_col3:
+                rename_files = st.checkbox(
+                    "Auto-rename files",
+                    value=True,
+                    help="Automatically rename files if they already exist"
+                )
 
     # Download section
     if st.button("🚀 Start Download"):
@@ -105,18 +143,34 @@ def main():
         
         # Create a container for download progress
         with st.container():
+            st.markdown("<div class='info-box'>", unsafe_allow_html=True)
             st.subheader("📥 Download Progress")
+            
+            # Download statistics
+            stats_col1, stats_col2 = st.columns(2)
+            with stats_col1:
+                start_time = time.time()
+                time_display = st.empty()
+            with stats_col2:
+                progress_display = st.empty()
+
             progress_bar = st.progress(0)
             status_text = st.empty()
             download_stats = st.empty()
+            st.markdown("</div>", unsafe_allow_html=True)
 
             success_count = 0
             total_urls = len(urls)
 
             for i, url in enumerate(urls):
                 try:
+                    # Update statistics
+                    elapsed_time = time.time() - start_time
+                    time_display.markdown(f"⏱️ **Elapsed Time:** {int(elapsed_time)}s")
+                    progress_display.markdown(f"📊 **Progress:** {i+1}/{total_urls} URLs")
+                    
                     status_text.info(f"⏳ Processing URL {i+1}/{total_urls}")
-                    download_stats.text(f"URL: {url}")
+                    download_stats.markdown(f"🔗 **Current URL:** {url}")
                     
                     # Extract video ID and create filename
                     video_id = extract_id(url)
@@ -145,24 +199,29 @@ def main():
 
                 progress_bar.progress((i + 1) / total_urls)
 
-            # Final status
+            # Final status with detailed statistics
             if success_count > 0:
                 st.balloons()
-                status_text.success(f"✨ Download complete! Successfully downloaded {success_count} out of {total_urls} videos.")
+                st.markdown(f"""
+                    <div class='stats-box'>
+                        <h3>📊 Download Summary</h3>
+                        <p>✅ Successfully downloaded: {success_count} videos</p>
+                        <p>❌ Failed downloads: {total_urls - success_count} videos</p>
+                        <p>⏱️ Total time: {int(time.time() - start_time)} seconds</p>
+                        <p>📁 Save location: {os.path.abspath(output_dir)}</p>
+                    </div>
+                """, unsafe_allow_html=True)
             else:
-                status_text.error("😔 No videos were downloaded successfully.")
+                st.error("😔 No videos were downloaded successfully.")
 
-            # Show download location
-            if success_count > 0:
-                st.info(f"📁 Videos were saved to: {os.path.abspath(output_dir)}")
-
-    # Footer
+    # Footer with additional information
     st.markdown("""
         <div style='margin-top: 3rem; text-align: center; color: #666;'>
             <hr>
             <p>Made with ❤️ using Streamlit</p>
+            <p style='font-size: 0.8rem;'>Last updated: {}</p>
         </div>
-    """, unsafe_allow_html=True)
+    """.format(datetime.now().strftime("%Y-%m-%d")), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main() 
