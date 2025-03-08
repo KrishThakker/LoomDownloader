@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loom Video Downloader</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <style>
+        .gradient-bg {
+            background: linear-gradient(135deg, #FF4B4B 0%, #FF8080 100%);
+        }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div class="container mx-auto px-4 py-8">
+        <!-- Header -->
+        <div class="gradient-bg rounded-lg shadow-lg p-8 mb-8 text-white text-center">
+            <h1 class="text-4xl font-bold mb-2">🎥 Loom Video Downloader</h1>
+            <p class="text-lg">Download your Loom videos quickly and easily</p>
+        </div>
+
+        <!-- Main Content -->
+        <div class="bg-white rounded-lg shadow-lg p-8 max-w-3xl mx-auto">
+            <!-- URL Input -->
+            <div class="mb-6">
+                <label class="block text-gray-700 text-sm font-bold mb-2" for="urls">
+                    📝 Video URLs (one per line)
+                </label>
+                <textarea
+                    id="urls"
+                    class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline"
+                    rows="6"
+                    placeholder="https://www.loom.com/share/your-video-id&#10;https://www.loom.com/share/another-video-id"
+                ></textarea>
+            </div>
+
+            <!-- Settings -->
+            <div class="mb-6">
+                <details class="bg-gray-50 rounded-lg p-4">
+                    <summary class="font-bold text-gray-700 cursor-pointer">⚙️ Advanced Settings</summary>
+                    <div class="mt-4 grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="max-size">
+                                Maximum file size (MB)
+                            </label>
+                            <input
+                                type="number"
+                                id="max-size"
+                                class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700"
+                                value="0"
+                                min="0"
+                                step="0.1"
+                            >
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 text-sm font-bold mb-2" for="output-dir">
+                                Output directory
+                            </label>
+                            <input
+                                type="text"
+                                id="output-dir"
+                                class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700"
+                                value="downloads"
+                            >
+                        </div>
+                    </div>
+                </details>
+            </div>
+
+            <!-- Download Button -->
+            <button
+                id="download-btn"
+                class="gradient-bg text-white font-bold py-3 px-6 rounded-lg w-full hover:opacity-90 transition-opacity"
+                onclick="startDownload()"
+            >
+                🚀 Start Download
+            </button>
+
+            <!-- Progress Section -->
+            <div id="progress-section" class="mt-8 hidden">
+                <h3 class="text-lg font-bold mb-4">📥 Download Progress</h3>
+                <div class="bg-gray-50 rounded-lg p-4">
+                    <div class="mb-4">
+                        <div class="w-full bg-gray-200 rounded-full h-2.5">
+                            <div id="progress-bar" class="gradient-bg h-2.5 rounded-full" style="width: 0%"></div>
+                        </div>
+                    </div>
+                    <p id="status-text" class="text-gray-700"></p>
+                    <p id="current-url" class="text-gray-500 text-sm mt-2"></p>
+                </div>
+
+                <!-- Download Summary -->
+                <div id="summary-section" class="mt-4 hidden">
+                    <div class="bg-gray-50 rounded-lg p-4">
+                        <h4 class="font-bold mb-2">📊 Download Summary</h4>
+                        <p id="success-count" class="text-green-600"></p>
+                        <p id="failed-count" class="text-red-600"></p>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="text-center mt-8 text-gray-600">
+            <p>Made with ❤️ using FastAPI</p>
+            <p class="text-sm">Last updated: <span id="last-updated"></span></p>
+        </div>
+    </div>
+
+    <script>
+        // Set the last updated date
+        document.getElementById('last-updated').textContent = new Date().toISOString().split('T')[0];
+
+        let activeDownloadId = null;
+        let statusCheckInterval = null;
+
+        async function startDownload() {
+            const urls = document.getElementById('urls').value.trim().split('\n').filter(url => url.trim());
+            if (urls.length === 0) {
+                alert('Please enter at least one URL');
+                return;
+            }
+
+            const maxSize = parseFloat(document.getElementById('max-size').value);
+            const outputDir = document.getElementById('output-dir').value;
+
+            // Show progress section
+            document.getElementById('progress-section').classList.remove('hidden');
+            document.getElementById('summary-section').classList.add('hidden');
+            document.getElementById('download-btn').disabled = true;
+
+            try {
+                const response = await fetch('/api/download', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        urls: urls,
+                        max_size: maxSize,
+                        output_dir: outputDir
+                    }),
+                });
+
+                const data = await response.json();
+                activeDownloadId = data.download_id;
+                
+                // Start checking status
+                statusCheckInterval = setInterval(checkStatus, 1000);
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Failed to start download');
+                document.getElementById('download-btn').disabled = false;
+            }
+        }
+
+        async function checkStatus() {
+            if (!activeDownloadId) return;
+
+            try {
+                const response = await fetch(`/api/status/${activeDownloadId}`);
+                const status = await response.json();
+
+                // Update progress
+                const progress = ((status.completed + status.failed) / status.total) * 100;
+                document.getElementById('progress-bar').style.width = `${progress}%`;
+                document.getElementById('status-text').textContent = status.status;
+                document.getElementById('current-url').textContent = status.current_url || '';
+
+                if (status.status === 'Completed' || status.status.startsWith('Failed')) {
+                    clearInterval(statusCheckInterval);
+                    document.getElementById('download-btn').disabled = false;
+                    showSummary(status);
+                }
+            } catch (error) {
+                console.error('Error:', error);
+                clearInterval(statusCheckInterval);
+                document.getElementById('download-btn').disabled = false;
+            }
+        }
+
+        function showSummary(status) {
+            document.getElementById('summary-section').classList.remove('hidden');
+            document.getElementById('success-count').textContent = `✅ Successfully downloaded: ${status.completed} videos`;
+            document.getElementById('failed-count').textContent = `❌ Failed downloads: ${status.failed} videos`;
+        }
+    </script>
+</body>
+</html> 

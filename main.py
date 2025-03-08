@@ -1,158 +1,43 @@
-#!/usr/bin/python3
-
-import argparse
-import json
-import urllib.request
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, FileResponse
+from pydantic import BaseModel
+from typing import List, Optional
 import os
-import time
-import os.path
-from os import statvfs
+import json
 import logging
-from tqdm import tqdm
+from datetime import datetime
+import uvicorn
 
+# Import the download functionality
+from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
 
-def format_size(size_bytes):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_bytes < 1024:
-            return f"{size_bytes:.1f}{unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.1f}GB"
+app = FastAPI(
+    title="Loom Video Downloader",
+    description="Download Loom videos easily",
+    version="1.0.0"
+)
 
+# Serve static files
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-def fetch_loom_download_url(id):
-    max_retries = 3
-    retry_delay = 5
-    
-    for attempt in range(max_retries):
-        try:
-            request = urllib.request.Request(
-                url=f"https://www.loom.com/api/campaigns/sessions/sessions/{id}/transcoded-url",
-                headers={
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Accept': 'application/json',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                },
-                method="POST",
-            )
-            response = urllib.request.urlopen(request)
-            body = response.read()
-            content = json.loads(body.decode("utf-8"))
-            if "url" not in content:
-                raise ValueError("Not a Loom video")
-            return content["url"]
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                raise ValueError("Video not found. Please check the video ID")
-            elif e.code == 429:  # Too Many Requests
-                if attempt < max_retries - 1:
-                    print(f"Rate limited. Waiting {retry_delay} seconds before retrying...")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
-            raise
-        except json.JSONDecodeError:
-            raise ValueError("Response from Loom API is possibly not valid JSON")
+# Models
+class DownloadRequest(BaseModel):
+    urls: List[str]
+    max_size: Optional[float] = 0
+    output_dir: str = "downloads"
 
+class DownloadStatus(BaseModel):
+    id: str
+    total: int
+    completed: int
+    failed: int
+    current_url: Optional[str] = None
+    status: str
+    errors: List[dict] = []
 
-def get_safe_filename(filename):
-    if not os.path.exists(filename):
-        return filename
-    
-    base, ext = os.path.splitext(filename)
-    counter = 1
-    while os.path.exists(f"{base}_{counter}{ext}"):
-        counter += 1
-    return f"{base}_{counter}{ext}"
-
-
-def download_loom_video(url, filename, max_retries=3, max_size=None, use_tqdm=True):
-    for attempt in range(max_retries):
-        try:
-            request = urllib.request.Request(url, method='HEAD')
-            response = urllib.request.urlopen(request)
-            file_size = int(response.headers['Content-Length'])
-            
-            # Check if the file size exceeds the maximum size
-            if max_size and file_size > max_size:
-                logging.warning(f"Skipping {filename}: file size {format_size(file_size)} exceeds maximum size of {format_size(max_size)}.")
-                return
-            
-            # Check if we have enough disk space
-            free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
-                         os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
-            if free_space < file_size:
-                raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
-            
-            # Handle file existence and resumption
-            downloaded = 0
-            headers = {}
-            if os.path.exists(filename):
-                downloaded = os.path.getsize(filename)
-                if downloaded < file_size:
-                    headers['Range'] = f'bytes={downloaded}-'
-                elif downloaded == file_size:
-                    logging.info(f"File {filename} already exists and is complete!")
-                    return
-                else:
-                    logging.warning(f"Existing file size is larger than expected ({downloaded}) ({file_size}). Starting fresh download now.")
-                    downloaded = 0
-            
-            request = urllib.request.Request(url, headers=headers)
-            response = urllib.request.urlopen(request)
-            
-            mode = 'ab' if downloaded > 0 else 'wb'
-            
-            with open(filename, mode) as f:
-                if use_tqdm:
-                    with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
-                        while True:
-                            chunk = response.read(8192)
-                            if not chunk:
-                                break
-                            downloaded += len(chunk)
-                            f.write(chunk)
-                            pbar.update(len(chunk))
-                else:
-                    while True:
-                        chunk = response.read(8192)
-                        if not chunk:
-                            break
-                        downloaded += len(chunk)
-                        f.write(chunk)
-                
-            logging.info(f'Download of {filename} completed successfully!')
-            return  # Exit the function after a successful download
-        except (urllib.error.URLError, IOError) as e:
-            logging.error(f"Download attempt {attempt + 1} failed: {str(e)}")
-            if attempt < max_retries - 1:
-                logging.info(f"Retrying download for {filename} (Attempt {attempt + 2}/{max_retries})...")
-                time.sleep(2)  # Wait before retrying
-            else:
-                raise RuntimeError(f"Download failed after {max_retries} attempts: {str(e)}")
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(
-        prog="loom-dl", description="this is a script to download loom.com videos"
-    )
-    parser.add_argument("--version", action="version", version="%(prog)s 1.0")
-    parser.add_argument(
-        "urls", nargs='+', help="Urls of the videos in the format https://www.loom.com/share/[ID]"
-    )
-    parser.add_argument("-o", "--out", help="Path to output the file to")
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
-    parser.add_argument("--max-size", type=float, help="Maximum download size in MB")
-    return parser.parse_args()
-
-
-def extract_id(url):
-    if not url.startswith("https://www.loom.com/share/"):
-        raise ValueError("Invalid Loom URL. Must start with 'https://www.loom.com/share/'")
-    video_id = url.split("/")[-1]
-    if not video_id:
-        raise ValueError("Invalid Loom URL. No video ID found")
-    return video_id
-
+# Store download status
+active_downloads = {}
 
 def setup_logging():
     logging.basicConfig(
@@ -164,43 +49,76 @@ def setup_logging():
         ]
     )
 
-
-def main():
-    setup_logging()
-    success_count = 0
-    failure_count = 0
+async def process_downloads(download_id: str, urls: List[str], max_size: float, output_dir: str):
+    status = active_downloads[download_id]
+    
     try:
-        arguments = parse_arguments()
+        os.makedirs(output_dir, exist_ok=True)
         
-        for url in arguments.urls:
-            id = extract_id(url)
-
-            video_url = fetch_loom_download_url(id)
-            filename = arguments.out or f"{id}.mp4"
-            
-            if os.path.exists(filename) and not arguments.overwrite:
-                filename = get_safe_filename(filename)
-                
-            logging.info(f"Downloading video {id} and saving to {filename}")
+        for i, url in enumerate(urls):
             try:
-                download_loom_video(video_url, filename, max_size=arguments.max_size)
-                success_count += 1
-            except RuntimeError as e:
-                logging.error(f"Failed to download video {id}: {str(e)}")
-                failure_count += 1
+                status.current_url = url
+                status.status = f"Processing {i+1}/{len(urls)}"
+                
+                # Extract video ID and create filename
+                video_id = extract_id(url)
+                filename = os.path.join(output_dir, f"{video_id}.mp4")
 
-        # Summary report
-        logging.info(f"Download Summary: {success_count} successful, {failure_count} failed.")
-    except ValueError as e:
-        logging.error(f"Error: {str(e)}")
-        exit(1)
-    except urllib.error.URLError as e:
-        logging.error(f"Network error: {str(e)}")
-        exit(1)
+                # Get download URL
+                video_url = fetch_loom_download_url(video_id)
+
+                # Download the video
+                max_size_bytes = max_size * 1024 * 1024 if max_size > 0 else None
+                download_loom_video(video_url, filename, max_size=max_size_bytes, use_tqdm=False)
+                
+                status.completed += 1
+                
+            except Exception as e:
+                status.failed += 1
+                status.errors.append({"url": url, "error": str(e)})
+                
+        status.status = "Completed"
+        status.current_url = None
+        
     except Exception as e:
-        logging.error(f"Unexpected error: {str(e)}")
-        exit(1)
+        status.status = f"Failed: {str(e)}"
 
+@app.get("/")
+async def root():
+    return FileResponse("static/index.html")
+
+@app.post("/api/download")
+async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Initialize download status
+    status = DownloadStatus(
+        id=download_id,
+        total=len(request.urls),
+        completed=0,
+        failed=0,
+        status="Starting"
+    )
+    active_downloads[download_id] = status
+    
+    # Start download in background
+    background_tasks.add_task(
+        process_downloads,
+        download_id,
+        request.urls,
+        request.max_size,
+        request.output_dir
+    )
+    
+    return {"download_id": download_id}
+
+@app.get("/api/status/{download_id}")
+async def get_status(download_id: str):
+    if download_id not in active_downloads:
+        raise HTTPException(status_code=404, detail="Download not found")
+    
+    return active_downloads[download_id]
 
 if __name__ == "__main__":
-    main()
+    setup_logging()
+    uvicorn.run(app, host="0.0.0.0", port=8000)
