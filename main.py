@@ -65,53 +65,57 @@ def get_safe_filename(filename):
     return f"{base}_{counter}{ext}"
 
 
-def download_loom_video(url, filename):
-    try:
-        request = urllib.request.Request(url, method='HEAD')
-        response = urllib.request.urlopen(request)
-        file_size = int(response.headers['Content-Length'])
-        
-        # Check if we have enough disk space
-        free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
-                     os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
-        if free_space < file_size:
-            raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
-        
-        # Handle file existence and resumption
-        downloaded = 0
-        headers = {}
-        if os.path.exists(filename):
-            downloaded = os.path.getsize(filename)
-            if downloaded < file_size:
-                headers['Range'] = f'bytes={downloaded}-'
-            elif downloaded == file_size:
-                logging.info(f"File {filename} already exists and is complete!")
-                return
+def download_loom_video(url, filename, max_retries=3):
+    for attempt in range(max_retries):
+        try:
+            request = urllib.request.Request(url, method='HEAD')
+            response = urllib.request.urlopen(request)
+            file_size = int(response.headers['Content-Length'])
+            
+            # Check if we have enough disk space
+            free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
+                         os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
+            if free_space < file_size:
+                raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
+            
+            # Handle file existence and resumption
+            downloaded = 0
+            headers = {}
+            if os.path.exists(filename):
+                downloaded = os.path.getsize(filename)
+                if downloaded < file_size:
+                    headers['Range'] = f'bytes={downloaded}-'
+                elif downloaded == file_size:
+                    logging.info(f"File {filename} already exists and is complete!")
+                    return
+                else:
+                    logging.warning(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download now.")
+                    downloaded = 0
+            
+            request = urllib.request.Request(url, headers=headers)
+            response = urllib.request.urlopen(request)
+            
+            mode = 'ab' if downloaded > 0 else 'wb'
+            
+            with open(filename, mode) as f:
+                with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+                        
+            logging.info(f'Download of {filename} completed successfully!')
+            return  # Exit the function after a successful download
+        except (urllib.error.URLError, IOError) as e:
+            logging.error(f"Download attempt {attempt + 1} failed: {str(e)}")
+            if attempt < max_retries - 1:
+                logging.info(f"Retrying download for {filename} (Attempt {attempt + 2}/{max_retries})...")
+                time.sleep(2)  # Wait before retrying
             else:
-                logging.warning(f"Existing file size ({downloaded}) is larger than expected ({file_size}). Starting fresh download now.")
-                downloaded = 0
-        
-        request = urllib.request.Request(url, headers=headers)
-        response = urllib.request.urlopen(request)
-        
-        mode = 'ab' if downloaded > 0 else 'wb'
-        
-        with open(filename, mode) as f:
-            with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    downloaded += len(chunk)
-                    f.write(chunk)
-                    pbar.update(len(chunk))
-                    
-        logging.info(f'Download of {filename} completed successfully!')
-    except (urllib.error.URLError, IOError) as e:
-        if os.path.exists(filename) and not downloaded:  # Only remove if we didn't partially download
-            os.remove(filename)
-        logging.error(f"Download failed: {str(e)}")
-        raise RuntimeError(f"Download failed: {str(e)}")
+                raise RuntimeError(f"Download failed after {max_retries} attempts: {str(e)}")
 
 
 def parse_arguments():
@@ -148,6 +152,8 @@ def setup_logging():
 
 def main():
     setup_logging()
+    success_count = 0
+    failure_count = 0
     try:
         arguments = parse_arguments()
         
@@ -161,7 +167,15 @@ def main():
                 filename = get_safe_filename(filename)
                 
             logging.info(f"Downloading video {id} and saving to {filename}")
-            download_loom_video(video_url, filename)
+            try:
+                download_loom_video(video_url, filename)
+                success_count += 1
+            except RuntimeError as e:
+                logging.error(f"Failed to download video {id}: {str(e)}")
+                failure_count += 1
+
+        # Summary report
+        logging.info(f"Download Summary: {success_count} successful, {failure_count} failed.")
     except ValueError as e:
         logging.error(f"Error: {str(e)}")
         exit(1)
