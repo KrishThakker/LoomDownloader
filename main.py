@@ -129,7 +129,7 @@ def parse_arguments():
         prog="loom-dl", description="script to download loom.com videos"
     )
     parser.add_argument(
-        "url", help="Url of the video in the format https://www.loom.com/share/[ID]"
+        "urls", nargs='+', help="Urls of the videos in the format https://www.loom.com/share/[ID]"
     )
     parser.add_argument("-o", "--out", help="Path to output the file to")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files")
@@ -148,17 +148,19 @@ def extract_id(url):
 def main():
     try:
         arguments = parse_arguments()
-        id = extract_id(arguments.url)
-
-        url = fetch_loom_download_url(id)
-        filename = arguments.out or f"{id}.mp4"
         
-        if os.path.exists(filename) and not arguments.out:
-            filename = get_safe_filename(filename)
+        for url in arguments.urls:
+            id = extract_id(url)
+
+            video_url = fetch_loom_download_url(id)
+            filename = arguments.out or f"{id}.mp4"
             
-        print(f"Downloading video {id} and saving to {filename}")
-        download_loom_video(url, filename)
-        print("Download completed successfully!")
+            if os.path.exists(filename) and not arguments.overwrite:
+                filename = get_safe_filename(filename)
+                
+            print(f"Downloading video {id} and saving to {filename}")
+            download_loom_video(video_url, filename)
+            print(f"Download of video {id} completed successfully!")
     except ValueError as e:
         print(f"Error: {str(e)}")
         exit(1)
