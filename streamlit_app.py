@@ -195,7 +195,7 @@ def main():
                 
                 with settings_col1:
                     max_size = st.number_input(
-                        "Taille maximale (MB)",
+                        "Taille maximale (Mo)",
                         min_value=0.0,
                         value=settings.get('max_size', 0.0),
                         help="Mettre à 0 pour aucune limite",
@@ -205,7 +205,7 @@ def main():
                 with settings_col2:
                     output_dir = st.text_input(
                         "Répertoire de sortie",
-                        value=settings.get('output_dir', 'downloads'),
+                        value=settings.get('output_dir', 'téléchargements'),
                         help="Répertoire où les vidéos seront enregistrées"
                     )
 
@@ -257,14 +257,14 @@ def main():
                             status = status_response.json()
                             progress = ((status['completed'] + status['failed']) / status['total']) * 100
                             progress_bar.progress(progress)
-                            status_text.text(f"Statut: {status['status']} | URL Actuelle: {status['current_url'] or 'N/A'}")
+                            status_text.text(f"Statut: {status['status']} | URL Actuelle: {status['current_url'] or 'Aucune'}")
                             
                             if status['status'] == 'Completed':
                                 st.balloons()
-                                st.success(f"Téléchargement terminé ! {status['completed']} vidéos téléchargées.")
+                                st.success(f"✅ Téléchargement terminé ! {status['completed']} vidéos téléchargées avec succès.")
                                 break
                             elif status['status'].startswith('Failed'):
-                                st.error(f"Le téléchargement a échoué pour {status['failed']} vidéos.")
+                                st.error(f"❌ Échec du téléchargement pour {status['failed']} vidéo(s). Erreurs: {', '.join([e['error'] for e in status['errors']])}")
                                 break
                         else:
                             st.error("Erreur lors de l'obtention de l'état du téléchargement.")
@@ -275,13 +275,13 @@ def main():
                 st.error(f"Erreur : {str(e)}")
 
     # Footer with additional information
-    st.markdown("""
+    st.markdown(f"""
         <div style='margin-top: 3rem; text-align: center; color: #666;'>
             <hr>
             <p>Fait avec ❤️ en utilisant Streamlit</p>
-            <p style='font-size: 0.8rem;'>Dernière mise à jour : {}</p>
+            <p style='font-size: 0.8rem;'>Dernière mise à jour : {datetime.now().strftime("%d/%m/%Y")}</p>
         </div>
-    """.format(datetime.now().strftime("%Y-%m-%d")), unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main() 
