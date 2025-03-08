@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import datetime
 import json
+import requests
 
 # Constants
 THEME_COLORS = {
@@ -147,7 +148,7 @@ def main():
             st.session_state.theme = theme
             settings['theme'] = theme
             save_settings(settings)
-            st.rerun()
+            st.experimental_rerun()
         
         st.divider()
         
@@ -219,88 +220,59 @@ def main():
         # Download button with loading animation
         download_placeholder = st.empty()
         if download_placeholder.button("🚀 Start Download", type="primary"):
-            with st.spinner("Preparing download..."):
-                if not urls_text.strip():
-                    st.error("⚠️ Please enter at least one URL")
-                    st.stop()
+            if not urls_text.strip():
+                st.error("⚠️ Please enter at least one URL")
+                st.stop()
 
-                # Create output directory if it doesn't exist
-                os.makedirs(output_dir, exist_ok=True)
+            # Show progress section
+            st.markdown("<div class='info-box'>", unsafe_allow_html=True)
+            st.subheader("📥 Download Progress")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            download_stats = st.empty()
+            st.markdown("</div>", unsafe_allow_html=True)
 
-                urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
-                
-                # Create a container for download progress
-                with st.container():
-                    st.markdown("<div class='info-box'>", unsafe_allow_html=True)
-                    st.subheader("📥 Download Progress")
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+
+            urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+            
+            try:
+                response = requests.post(
+                    'http://localhost:8000/api/download',
+                    json={
+                        'urls': urls,
+                        'max_size': float(max_size),
+                        'output_dir': output_dir
+                    }
+                )
+
+                if response.status_code == 200:
+                    download_id = response.json()['download_id']
                     
-                    # Download statistics
-                    stats_col1, stats_col2 = st.columns(2)
-                    with stats_col1:
-                        start_time = time.time()
-                        time_display = st.empty()
-                    with stats_col2:
-                        progress_display = st.empty()
-
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    download_stats = st.empty()
-                    st.markdown("</div>", unsafe_allow_html=True)
-
-                    success_count = 0
-                    total_urls = len(urls)
-
-                    for i, url in enumerate(urls):
-                        try:
-                            # Update statistics
-                            elapsed_time = time.time() - start_time
-                            time_display.markdown(f"⏱️ **Elapsed Time:** {int(elapsed_time)}s")
-                            progress_display.markdown(f"📊 **Progress:** {i+1}/{total_urls} URLs")
+                    # Start monitoring in a separate thread
+                    while True:
+                        status_response = requests.get(f'http://localhost:8000/api/status/{download_id}')
+                        if status_response.status_code == 200:
+                            status = status_response.json()
+                            progress = ((status['completed'] + status['failed']) / status['total']) * 100
+                            progress_bar.progress(progress)
+                            status_text.text(f"Status: {status['status']} | Current URL: {status['current_url'] or 'N/A'}")
                             
-                            status_text.info(f"⏳ Processing URL {i+1}/{total_urls}")
-                            download_stats.markdown(f"🔗 **Current URL:** {url}")
-                            
-                            # Extract video ID and create filename
-                            video_id = extract_id(url)
-                            filename = os.path.join(output_dir, f"{video_id}.mp4")
-
-                            # Get download URL
-                            video_url = fetch_loom_download_url(video_id)
-
-                            # Download the video
-                            max_size_bytes = max_size * 1024 * 1024 if max_size > 0 else None
-                            download_loom_video(video_url, filename, max_size=max_size_bytes, use_tqdm=False)
-                            
-                            success_count += 1
-                            st.markdown(f"""
-                                <div class='success-message'>
-                                    ✅ Successfully downloaded: {url}
-                                </div>
-                            """, unsafe_allow_html=True)
-
-                        except Exception as e:
-                            st.markdown(f"""
-                                <div class='error-message'>
-                                    ❌ Failed to download {url}: {str(e)}
-                                </div>
-                            """, unsafe_allow_html=True)
-
-                        progress_bar.progress((i + 1) / total_urls)
-
-                    # Final status with detailed statistics
-                    if success_count > 0:
-                        st.balloons()
-                        st.markdown(f"""
-                            <div class='stats-box'>
-                                <h3>📊 Download Summary</h3>
-                                <p>✅ Successfully downloaded: {success_count} videos</p>
-                                <p>❌ Failed downloads: {total_urls - success_count} videos</p>
-                                <p>⏱️ Total time: {int(time.time() - start_time)} seconds</p>
-                                <p>📁 Save location: {os.path.abspath(output_dir)}</p>
-                            </div>
-                        """, unsafe_allow_html=True)
-                    else:
-                        st.error("😔 No videos were downloaded successfully.")
+                            if status['status'] == 'Completed':
+                                st.balloons()
+                                st.success(f"Download complete! {status['completed']} videos downloaded.")
+                                break
+                            elif status['status'].startswith('Failed'):
+                                st.error(f"Download failed for {status['failed']} videos.")
+                                break
+                        else:
+                            st.error("Error fetching download status.")
+                            break
+                else:
+                    st.error("Failed to start download.")
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
 
     # Footer with additional information
     st.markdown("""
