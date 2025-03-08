@@ -65,7 +65,7 @@ def get_safe_filename(filename):
     return f"{base}_{counter}{ext}"
 
 
-def download_loom_video(url, filename, max_retries=3, max_size=None):
+def download_loom_video(url, filename, max_retries=3, max_size=None, use_tqdm=True):
     for attempt in range(max_retries):
         try:
             request = urllib.request.Request(url, method='HEAD')
@@ -73,15 +73,15 @@ def download_loom_video(url, filename, max_retries=3, max_size=None):
             file_size = int(response.headers['Content-Length'])
             
             # Check if the file size exceeds the maximum size
-            if max_size and file_size > max_size * 1024 * 1024:
-                logging.warning(f"Skipping {filename}: file size {format_size(file_size)} exceeds maximum size of {max_size} MB.")
+            if max_size and file_size > max_size:
+                logging.warning(f"Skipping {filename}: file size {format_size(file_size)} exceeds maximum size of {format_size(max_size)}.")
                 return
             
             # Check if we have enough disk space
             free_space = os.statvfs(os.path.dirname(os.path.abspath(filename))).f_frsize * \
                          os.statvfs(os.path.dirname(os.path.abspath(filename))).f_bavail
             if free_space < file_size:
-                raise IOError(f"Not enough disk space honestly. Need {format_size(file_size)}, have {format_size(free_space)}")
+                raise IOError(f"Not enough disk space. Need {format_size(file_size)}, have {format_size(free_space)}")
             
             # Handle file existence and resumption
             downloaded = 0
@@ -103,14 +103,22 @@ def download_loom_video(url, filename, max_retries=3, max_size=None):
             mode = 'ab' if downloaded > 0 else 'wb'
             
             with open(filename, mode) as f:
-                with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
+                if use_tqdm:
+                    with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
+                        while True:
+                            chunk = response.read(8192)
+                            if not chunk:
+                                break
+                            downloaded += len(chunk)
+                            f.write(chunk)
+                            pbar.update(len(chunk))
+                else:
                     while True:
                         chunk = response.read(8192)
                         if not chunk:
                             break
                         downloaded += len(chunk)
                         f.write(chunk)
-                        pbar.update(len(chunk))
                 
             logging.info(f'Download of {filename} completed successfully!')
             return  # Exit the function after a successful download
