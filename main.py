@@ -8,6 +8,7 @@ import time
 import os.path
 from os import statvfs
 import logging
+from tqdm import tqdm
 
 
 def format_size(size_bytes):
@@ -101,20 +102,19 @@ def download_loom_video(url, filename, max_retries=3, max_size=None):
             
             mode = 'ab' if downloaded > 0 else 'wb'
             
-            print(f"Downloading {filename}... ", end='', flush=True)
             with open(filename, mode) as f:
-                while True:
-                    chunk = response.read(8192)
-                    if not chunk:
-                        break
-                    downloaded += len(chunk)
-                    f.write(chunk)
+                with tqdm(total=file_size, initial=downloaded, unit='B', unit_scale=True, desc=filename) as pbar:
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        downloaded += len(chunk)
+                        f.write(chunk)
+                        pbar.update(len(chunk))
                 
-            print("Done!")
             logging.info(f'Download of {filename} completed successfully!')
             return  # Exit the function after a successful download
         except (urllib.error.URLError, IOError) as e:
-            print("Failed!")  # In case of error, print failure
             logging.error(f"Download attempt {attempt + 1} failed: {str(e)}")
             if attempt < max_retries - 1:
                 logging.info(f"Retrying download for {filename} (Attempt {attempt + 2}/{max_retries})...")
@@ -127,6 +127,7 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         prog="loom-dl", description="this is a script to download loom.com videos"
     )
+    parser.add_argument("--version", action="version", version="%(prog)s 1.0")
     parser.add_argument(
         "urls", nargs='+', help="Urls of the videos in the format https://www.loom.com/share/[ID]"
     )
