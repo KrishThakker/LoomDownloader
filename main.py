@@ -228,7 +228,7 @@ def main():
                     )
                     monitor_thread.start()
                     
-            except Exception as e:
+    except Exception as e:
                 sg.popup_error(f'Error starting download: {e}')
 
         elif event == '-PROGRESS-':

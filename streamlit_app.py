@@ -30,7 +30,7 @@ def load_settings():
                 return json.load(f)
     except:
         pass
-    return {'theme': 'light', 'output_dir': 'downloads', 'max_size': 0}
+    return {'theme': 'light', 'output_dir': 'descargas', 'max_size': 0}
 
 def save_settings(settings):
     with open('settings.json', 'w') as f:
@@ -49,24 +49,24 @@ def get_theme_colors():
     return THEME_COLORS['dark'] if st.session_state.get('theme', 'light') == 'dark' else THEME_COLORS['light']
 
 def main():
-    # Geladene Einstellungen
+    # Load saved settings
     settings = load_settings()
     
-    # Seitenkonfiguration
+    # Page configuration
     st.set_page_config(
-        page_title="Loom Video Downloader",
+        page_title="Descargador de Videos Loom",
         page_icon="🎥",
         layout="wide",
         initial_sidebar_state="expanded"
     )
 
-    # Initialisiere den Sitzungsstatus
+    # Initialize session state
     if 'theme' not in st.session_state:
         st.session_state.theme = settings.get('theme', 'light')
 
     colors = get_theme_colors()
 
-    # Benutzerdefiniertes CSS mit verbessertem Styling und Unterstützung für das Thema
+    # Custom CSS with improved styling and theme support
     st.markdown(f"""
         <style>
         .main {{
@@ -133,13 +133,13 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    # Seitenleiste
+    # Sidebar
     with st.sidebar:
-        st.title("⚙️ Einstellungen")
+        st.title("⚙️ Configuración")
         
-        # Themenauswahl
+        # Theme selector
         theme = st.selectbox(
-            "Thema",
+            "Tema",
             options=['light', 'dark'],
             index=0 if st.session_state.theme == 'light' else 1
         )
@@ -152,64 +152,64 @@ def main():
         
         st.divider()
         
-        # Hilfebereich
+        # Help section
         st.markdown("""
-            ### 📖 So benutzt du es
-            1. Füge die Loom-Video-URLs ein
-            2. Konfiguriere die Einstellungen
-            3. Klicke auf Herunterladen
+            ### 📖 Cómo Usar
+            1. Pega las URLs de los videos de Loom
+            2. Configura los ajustes
+            3. Haz clic en Descargar
             
-            ### 🔗 Unterstützte URLs
+            ### 🔗 URLs Soportadas
             - https://www.loom.com/share/[ID]
             
-            ### ❓ Brauchst du Hilfe?
-            [Dokumentation](https://github.com/yourusername/loom-downloader)
+            ### ❓ ¿Necesitas Ayuda?
+            [Documentación](https://github.com/yourusername/loom-downloader)
         """)
 
     setup_logging()
 
-    # Hauptinhalt
+    # Main content
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        # Kopfzeile mit Farbverlauf
+        # Header section with gradient background
         st.markdown("""
             <div class='header-box'>
-                <h1 style='margin:0;'>🎥 Loom Video Downloader</h1>
-                <p style='margin:0.5rem 0 0 0;'>Lade deine Loom-Videos schnell und einfach herunter</p>
+                <h1 style='margin:0;'>🎥 Descargador de Videos Loom</h1>
+                <p style='margin:0.5rem 0 0 0;'>Descarga tus videos de Loom rápida y fácilmente</p>
             </div>
         """, unsafe_allow_html=True)
 
-        # Haupt-Eingabebereich
+        # Main input section
         with st.container():
-            st.subheader("📝 Video-URLs")
+            st.subheader("📝 URLs de Videos")
             urls_text = st.text_area(
-                "Gib Loom-URLs ein (eine pro Zeile)",
+                "Ingresa las URLs de Loom (una por línea)",
                 height=150,
-                help="Gib URLs im Format https://www.loom.com/share/[ID] ein",
-                placeholder="https://www.loom.com/share/deine-video-id\nhttps://www.loom.com/share/andere-video-id"
+                help="Ingresa URLs en el formato https://www.loom.com/share/[ID]",
+                placeholder="https://www.loom.com/share/tu-id-de-video\nhttps://www.loom.com/share/otro-id-de-video"
             )
 
-            # Erweiterte Einstellungen in einem Expander
-            with st.expander("⚙️ Erweiterte Einstellungen"):
+            # Advanced settings in an expander
+            with st.expander("⚙️ Configuración Avanzada"):
                 settings_col1, settings_col2 = st.columns(2)
                 
                 with settings_col1:
                     max_size = st.number_input(
-                        "Maximale Größe (MB)",
+                        "Tamaño máximo (MB)",
                         min_value=0.0,
                         value=settings.get('max_size', 0.0),
-                        help="Auf 0 setzen für kein Limit",
+                        help="Establecer en 0 para sin límite",
                         format="%.1f"
                     )
                     
                 with settings_col2:
                     output_dir = st.text_input(
-                        "Ausgabeverzeichnis",
-                        value=settings.get('output_dir', 'downloads'),
-                        help="Verzeichnis, in dem die Videos gespeichert werden"
+                        "Directorio de salida",
+                        value=settings.get('output_dir', 'descargas'),
+                        help="Directorio donde se guardarán los videos"
                     )
 
-                # Einstellungen speichern
+                # Save settings
                 if max_size != settings.get('max_size') or output_dir != settings.get('output_dir'):
                     settings.update({
                         'max_size': max_size,
@@ -217,22 +217,22 @@ def main():
                     })
                     save_settings(settings)
 
-        # Download-Button mit Ladeanimation
+        # Download button with loading animation
         download_placeholder = st.empty()
-        if download_placeholder.button("🚀 Download starten", type="primary"):
+        if download_placeholder.button("🚀 Iniciar Descarga", type="primary"):
             if not urls_text.strip():
-                st.error("⚠️ Bitte gib mindestens eine URL ein")
+                st.error("⚠️ Por favor, ingresa al menos una URL")
                 st.stop()
 
-            # Fortschrittsbereich anzeigen
+            # Show progress section
             st.markdown("<div class='info-box'>", unsafe_allow_html=True)
-            st.subheader("📥 Download-Fortschritt")
+            st.subheader("📥 Progreso de la Descarga")
             progress_bar = st.progress(0)
             status_text = st.empty()
             download_stats = st.empty()
             st.markdown("</div>", unsafe_allow_html=True)
 
-            # Ausgabeverzeichnis erstellen, falls es nicht existiert
+            # Create output directory if it doesn't exist
             os.makedirs(output_dir, exist_ok=True)
 
             urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
@@ -250,36 +250,36 @@ def main():
                 if response.status_code == 200:
                     download_id = response.json()['download_id']
                     
-                    # Überwachung in einem separaten Thread starten
+                    # Start monitoring in a separate thread
                     while True:
                         status_response = requests.get(f'http://localhost:8000/api/status/{download_id}')
                         if status_response.status_code == 200:
                             status = status_response.json()
                             progress = ((status['completed'] + status['failed']) / status['total']) * 100
                             progress_bar.progress(progress)
-                            status_text.text(f"Status: {status['status']} | Aktuelle URL: {status['current_url'] or 'N/A'}")
+                            status_text.text(f"Estado: {status['status']} | URL Actual: {status['current_url'] or 'N/A'}")
                             
                             if status['status'] == 'Completed':
                                 st.balloons()
-                                st.success(f"Download abgeschlossen! {status['completed']} Videos heruntergeladen.")
+                                st.success(f"¡Descarga completa! {status['completed']} videos descargados.")
                                 break
                             elif status['status'].startswith('Failed'):
-                                st.error(f"Der Download ist für {status['failed']} Videos fehlgeschlagen.")
+                                st.error(f"La descarga falló para {status['failed']} videos.")
                                 break
                         else:
-                            st.error("Fehler beim Abrufen des Download-Status.")
+                            st.error("Error al obtener el estado de la descarga.")
                             break
                 else:
-                    st.error("Fehler beim Starten des Downloads.")
+                    st.error("Error al iniciar la descarga.")
             except Exception as e:
-                st.error(f"Fehler: {str(e)}")
+                st.error(f"Error: {str(e)}")
 
-    # Fußzeile mit zusätzlichen Informationen
+    # Footer with additional information
     st.markdown("""
         <div style='margin-top: 3rem; text-align: center; color: #666;'>
             <hr>
-            <p>Hergestellt mit ❤️ unter Verwendung von Streamlit</p>
-            <p style='font-size: 0.8rem;'>Letzte Aktualisierung: {}</p>
+            <p>Hecho con ❤️ usando Streamlit</p>
+            <p style='font-size: 0.8rem;'>Última actualización: {}</p>
         </div>
     """.format(datetime.now().strftime("%Y-%m-%d")), unsafe_allow_html=True)
 
