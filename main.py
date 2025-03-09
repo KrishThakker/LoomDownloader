@@ -115,7 +115,7 @@ async def root():
 async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
     # Validate max_size
     if request.max_size < 0:
-        raise HTTPException(status_code=400, detail="Max size must be a non-negative number.")
+        raise HTTPException(status_code=400, detail="Max size must be a number above zero.")
     
     download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
