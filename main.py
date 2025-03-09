@@ -22,7 +22,7 @@ DEFAULT_PORT = 8000
 DEFAULT_HOST = '0.0.0.0'
 
 app = FastAPI(
-    title="Loom Video Downloader",
+    title="Loom Video Downloader File Downloader",
     description="Download Loom videos easily",
     version="1.0.0"
 )
