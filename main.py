@@ -227,8 +227,9 @@ def main():
                         daemon=True
                     )
                     monitor_thread.start()
-                    
-    except Exception as e:
+                else:
+                    sg.popup_error('Failed to start download: Server error')
+            except Exception as e:
                 sg.popup_error(f'Error starting download: {e}')
 
         elif event == '-PROGRESS-':
