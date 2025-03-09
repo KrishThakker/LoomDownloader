@@ -51,6 +51,7 @@ from celery import Celery
 from redis import Redis
 import aioredis
 import asyncpg
+import zipfile
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -1670,6 +1671,184 @@ async def get_download_stats(
         
     except Exception as e:
         logger.error(f"Error getting download stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add new file management endpoint
+@app.post("/api/v1/files/manage", response_model=APIResponse)
+@rate_limit(limit=20)
+async def manage_files(
+    request: Request,
+    operation: str,
+    file_paths: List[str],
+    target_dir: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Manage downloaded files
+    Operations: move, delete, archive, validate
+    """
+    try:
+        results = []
+        failed = []
+        
+        # Validate target directory if provided
+        if target_dir:
+            target_dir = Path(target_dir)
+            if not target_dir.is_absolute():
+                target_dir = Path.cwd() / target_dir
+            if not target_dir.exists():
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+        for file_path in file_paths:
+            try:
+                path = Path(file_path)
+                if not path.exists():
+                    failed.append({
+                        "path": str(path),
+                        "error": "File not found"
+                    })
+                    continue
+
+                if operation == "move" and target_dir:
+                    # Move file to target directory
+                    new_path = target_dir / path.name
+                    shutil.move(str(path), str(new_path))
+                    results.append({
+                        "path": str(path),
+                        "new_path": str(new_path),
+                        "status": "moved"
+                    })
+
+                elif operation == "delete":
+                    # Delete file
+                    path.unlink()
+                    results.append({
+                        "path": str(path),
+                        "status": "deleted"
+                    })
+
+                elif operation == "archive":
+                    # Create zip archive
+                    archive_name = path.stem + ".zip"
+                    archive_path = path.parent / archive_name
+                    with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                        zipf.write(path, path.name)
+                    results.append({
+                        "path": str(path),
+                        "archive_path": str(archive_path),
+                        "status": "archived"
+                    })
+
+                elif operation == "validate":
+                    # Validate file integrity
+                    if path.suffix.lower() in SecurityConfig.ALLOWED_FILE_TYPES:
+                        size = path.stat().st_size
+                        is_valid = size > 0 and size < SecurityConfig.FILE_SIZE_LIMIT
+                        results.append({
+                            "path": str(path),
+                            "size": size,
+                            "is_valid": is_valid,
+                            "status": "validated"
+                        })
+                    else:
+                        failed.append({
+                            "path": str(path),
+                            "error": "Invalid file type"
+                        })
+
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid operation: {operation}"
+                    )
+
+                # Log the operation
+                logger.info(f"File operation {operation} performed on {path}")
+
+            except Exception as e:
+                logger.error(f"Error in file operation for {file_path}: {e}")
+                failed.append({
+                    "path": file_path,
+                    "error": str(e)
+                })
+
+        return APIResponse(
+            status="success" if not failed else "partial_success",
+            message=f"File operation {operation} completed",
+            data={
+                "successful": results,
+                "failed": failed,
+                "total_processed": len(file_paths),
+                "success_count": len(results),
+                "failure_count": len(failed)
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"File management error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add file search endpoint
+@app.get("/api/v1/files/search", response_model=APIResponse)
+@rate_limit(limit=30)
+async def search_files(
+    request: Request,
+    pattern: str,
+    directory: Optional[str] = "downloads",
+    recursive: bool = True,
+    current_user: User = Depends(get_current_user)
+):
+    """Search for downloaded files matching a pattern"""
+    try:
+        base_dir = Path(directory)
+        if not base_dir.is_absolute():
+            base_dir = Path.cwd() / base_dir
+
+        if not base_dir.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Directory not found: {directory}"
+            )
+
+        # Compile search pattern
+        try:
+            regex = re.compile(pattern)
+        except re.error:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid search pattern"
+            )
+
+        # Search for files
+        matches = []
+        if recursive:
+            search_paths = base_dir.rglob("*")
+        else:
+            search_paths = base_dir.glob("*")
+
+        for path in search_paths:
+            if path.is_file() and regex.search(path.name):
+                matches.append({
+                    "path": str(path),
+                    "name": path.name,
+                    "size": path.stat().st_size,
+                    "modified": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc),
+                    "type": path.suffix.lower()
+                })
+
+        return APIResponse(
+            status="success",
+            message="File search completed",
+            data={
+                "pattern": pattern,
+                "directory": str(base_dir),
+                "total_matches": len(matches),
+                "matches": matches
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"File search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
