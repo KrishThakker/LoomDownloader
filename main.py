@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import os
 import json
 import logging
@@ -12,6 +12,7 @@ import threading
 import requests
 import uvicorn
 import time
+from fastapi.middleware.cors import CORSMiddleware
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -22,13 +23,22 @@ DEFAULT_PORT = 8000
 DEFAULT_HOST = '0.0.0.0'
 
 app = FastAPI(
-    title="Loom Video Downloader File Downloader",
-    description="Download Loom videos easily",
+    title="Loom Video Downloader API",
+    description="API for downloading Loom videos",
     version="1.0.0"
 )
 
 # Serve static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Models with enhanced validation
 class DownloadRequest(BaseModel):
@@ -111,42 +121,134 @@ async def process_downloads(download_id: str, urls: List[str], max_size: float, 
 async def root():
     return FileResponse("static/index.html")
 
-@app.post("/api/download")
-async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
-    # Validate max_size
-    if request.max_size < 0:
-        raise HTTPException(status_code=400, detail="Max size must be a number above zero.")
+@app.post("/api/v1/download")
+async def api_download(
+    urls: List[str],
+    max_size: Optional[float] = 0,
+    output_dir: Optional[str] = "downloads",
+    rename_pattern: Optional[str] = "{id}",
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Download videos from Loom URLs
     
-    download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Initialize download status
-    status = DownloadStatus(
-        id=download_id,
-        total=len(request.urls),
-        completed=0,
-        failed=0,
-        status="Starting"
-    )
-    active_downloads[download_id] = status
-    
-    # Start download in background
-    background_tasks.add_task(
-        process_downloads,
-        download_id,
-        request.urls,
-        request.max_size,
-        request.output_dir
-    )
-    
-    logging.info(f"Download started: {download_id} with {len(request.urls)} URLs.")
-    return {"download_id": download_id}
+    - **urls**: List of Loom video URLs
+    - **max_size**: Maximum file size in MB (0 for no limit)
+    - **output_dir**: Directory to save downloaded files
+    - **rename_pattern**: Pattern for renaming files
+    """
+    try:
+        # Validate max_size
+        if max_size < 0:
+            raise HTTPException(status_code=400, detail="Max size must be a number above zero.")
 
-@app.get("/api/status/{download_id}")
-async def get_status(download_id: str):
-    if download_id not in active_downloads:
-        raise HTTPException(status_code=404, detail="Download not found")
-    
-    return active_downloads[download_id]
+        # Generate download ID
+        download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Initialize download status
+        status = DownloadStatus(
+            id=download_id,
+            total=len(urls),
+            completed=0,
+            failed=0,
+            status="Starting"
+        )
+        active_downloads[download_id] = status
+        
+        # Start download in background
+        background_tasks.add_task(
+            process_downloads,
+            download_id,
+            urls,
+            max_size,
+            output_dir
+        )
+        
+        logging.info(f"API Download started: {download_id} with {len(urls)} URLs.")
+        
+        return {
+            "status": "success",
+            "message": "Download started",
+            "download_id": download_id,
+            "total_urls": len(urls)
+        }
+        
+    except Exception as e:
+        logging.error(f"API Download error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/downloads")
+async def list_downloads():
+    """List all active downloads"""
+    try:
+        return {
+            "downloads": [
+                {
+                    "id": download_id,
+                    "status": status.dict()
+                }
+                for download_id, status in active_downloads.items()
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/download/{download_id}")
+async def get_download_status(download_id: str):
+    """Get status of a specific download"""
+    try:
+        if download_id not in active_downloads:
+            raise HTTPException(status_code=404, detail="Download not found")
+        
+        status = active_downloads[download_id]
+        return {
+            "id": download_id,
+            "status": status.dict(),
+            "details": {
+                "progress": ((status.completed + status.failed) / status.total * 100 
+                           if status.total > 0 else 0),
+                "completed_urls": status.completed,
+                "failed_urls": status.failed,
+                "total_urls": status.total,
+                "current_url": status.current_url,
+                "errors": status.errors
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/download/{download_id}")
+async def cancel_download(download_id: str):
+    """Cancel a specific download"""
+    try:
+        if download_id not in active_downloads:
+            raise HTTPException(status_code=404, detail="Download not found")
+        
+        status = active_downloads[download_id]
+        status.status = "Cancelled"
+        
+        return {"status": "success", "message": f"Download {download_id} cancelled"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add API documentation info
+@app.get("/api/v1/docs")
+async def get_api_docs():
+    """Get API documentation"""
+    return {
+        "endpoints": {
+            "POST /api/v1/download": "Start a new download",
+            "GET /api/v1/downloads": "List all downloads",
+            "GET /api/v1/download/{download_id}": "Get download status",
+            "DELETE /api/v1/download/{download_id}": "Cancel download"
+        },
+        "example_request": {
+            "urls": ["https://www.loom.com/share/example-id"],
+            "max_size": 100,
+            "output_dir": "downloads",
+            "rename_pattern": "{id}"
+        }
+    }
 
 def format_time(seconds: int) -> str:
     """Format seconds into human readable time."""
