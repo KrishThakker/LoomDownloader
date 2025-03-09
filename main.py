@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -22,6 +22,11 @@ import hashlib
 import bcrypt
 from enum import Enum
 from fastapi import Request
+from fastapi.middleware.securityheaders import SecurityHeadersMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+import uuid
+import re
+from fastapi import Cookie
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -41,6 +46,15 @@ class SecurityConfig:
     MAX_LOGIN_ATTEMPTS = 5
     LOCKOUT_DURATION = 15  # minutes
     PEPPER = os.getenv("PEPPER", secrets.token_hex(16))
+    TRUSTED_HOSTS = ["localhost", "127.0.0.1"]
+    CORS_ORIGINS = ["http://localhost:8501"]  # Streamlit default port
+    SESSION_COOKIE_NAME = "session_id"
+    SESSION_EXPIRE_MINUTES = 60
+    PASSWORD_REGEX = r"^(?=.*[A-Za-z])(?=.*\d)(?=.*[@$!%*#?&])[A-Za-z\d@$!%*#?&]{8,}$"
+    MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # 10MB
+    RATE_LIMIT_WINDOW = 60  # seconds
+    RATE_LIMIT_MAX_REQUESTS = 100
+    ALLOWED_FILE_TYPES = [".mp4", ".mov", ".avi"]
 
 # Password hashing
 pwd_context = CryptContext(
@@ -67,6 +81,24 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# Add security middleware
+app.add_middleware(
+    SecurityHeadersMiddleware,
+    headers={
+        "X-Frame-Options": "DENY",
+        "X-Content-Type-Options": "nosniff",
+        "X-XSS-Protection": "1; mode=block",
+        "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+        "Content-Security-Policy": "default-src 'self'; frame-ancestors 'none'",
+        "Referrer-Policy": "strict-origin-when-cross-origin"
+    }
+)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=SecurityConfig.TRUSTED_HOSTS
 )
 
 # Models with enhanced validation
@@ -220,27 +252,177 @@ async def process_downloads(download_id: str, urls: List[str], max_size: float, 
 async def root():
     return FileResponse("static/index.html")
 
+# Add session management
+class SessionManager:
+    def __init__(self):
+        self.sessions = {}
+        self.session_times = {}
+
+    def create_session(self, user_id: str) -> str:
+        session_id = str(uuid.uuid4())
+        self.sessions[session_id] = user_id
+        self.session_times[session_id] = datetime.now()
+        return session_id
+
+    def validate_session(self, session_id: str) -> Optional[str]:
+        if session_id in self.sessions:
+            session_time = self.session_times[session_id]
+            if datetime.now() - session_time > timedelta(minutes=SecurityConfig.SESSION_EXPIRE_MINUTES):
+                self.remove_session(session_id)
+                return None
+            self.session_times[session_id] = datetime.now()  # Update last access
+            return self.sessions[session_id]
+        return None
+
+    def remove_session(self, session_id: str):
+        if session_id in self.sessions:
+            del self.sessions[session_id]
+            del self.session_times[session_id]
+
+session_manager = SessionManager()
+
+# Add input validation functions
+def validate_password(password: str) -> bool:
+    """Validate password strength"""
+    return bool(re.match(SecurityConfig.PASSWORD_REGEX, password))
+
+def sanitize_filename(filename: str) -> str:
+    """Sanitize filename to prevent path traversal"""
+    return os.path.basename(filename)
+
+def validate_file_type(filename: str) -> bool:
+    """Validate file extension"""
+    return any(filename.lower().endswith(ext) for ext in SecurityConfig.ALLOWED_FILE_TYPES)
+
+# Update the login endpoint with enhanced security
+@app.post("/token", response_model=Token)
+async def login(
+    response: Response,
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    request: Request = None
+):
+    client_ip = request.client.host
+    
+    # Check rate limiting
+    if rate_limiter.is_rate_limited(client_ip, "login"):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please try again later."
+        )
+
+    try:
+        # Validate input length to prevent buffer overflow
+        if len(form_data.username) > 100 or len(form_data.password) > 100:
+            raise HTTPException(status_code=400, detail="Invalid input length")
+
+        user = authenticate_user(users_db, form_data.username, form_data.password)
+        if not user:
+            rate_limiter.record_login_attempt(form_data.username, False)
+            raise HTTPException(
+                status_code=401,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        rate_limiter.record_login_attempt(form_data.username, True)
+        
+        # Create session
+        session_id = session_manager.create_session(user.username)
+        
+        # Generate tokens
+        access_token_expires = timedelta(minutes=SecurityConfig.ACCESS_TOKEN_EXPIRE_MINUTES)
+        refresh_token_expires = timedelta(days=SecurityConfig.REFRESH_TOKEN_EXPIRE_DAYS)
+        
+        access_token = create_access_token(
+            data={
+                "sub": user.username,
+                "role": user.role,
+                "session": session_id
+            },
+            expires_delta=access_token_expires
+        )
+        
+        refresh_token = create_access_token(
+            data={
+                "sub": user.username,
+                "refresh": True,
+                "session": session_id
+            },
+            expires_delta=refresh_token_expires
+        )
+
+        # Set secure cookie
+        response.set_cookie(
+            key=SecurityConfig.SESSION_COOKIE_NAME,
+            value=session_id,
+            httponly=True,
+            secure=True,
+            samesite="strict",
+            max_age=SecurityConfig.SESSION_EXPIRE_MINUTES * 60
+        )
+
+        # Update last login and reset failed attempts
+        users_db[user.username].last_login = datetime.now()
+        users_db[user.username].failed_attempts = 0
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+        
+    except Exception as e:
+        logging.error(f"Login error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Add logout endpoint
+@app.post("/logout")
+async def logout(
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    session_id: str = Cookie(None, alias=SecurityConfig.SESSION_COOKIE_NAME)
+):
+    if session_id:
+        session_manager.remove_session(session_id)
+    
+    response.delete_cookie(
+        key=SecurityConfig.SESSION_COOKIE_NAME,
+        httponly=True,
+        secure=True,
+        samesite="strict"
+    )
+    
+    return {"message": "Successfully logged out"}
+
+# Update the download endpoint with additional security
 @app.post("/api/v1/download")
 async def api_download(
+    request: Request,
     urls: List[str],
     max_size: Optional[float] = 0,
     output_dir: Optional[str] = "downloads",
     rename_pattern: Optional[str] = "{id}",
     background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_user)  # Add authentication
+    current_user: User = Depends(get_current_user)
 ):
-    """
-    Download videos from Loom URLs
-    
-    - **urls**: List of Loom video URLs
-    - **max_size**: Maximum file size in MB (0 for no limit)
-    - **output_dir**: Directory to save downloaded files
-    - **rename_pattern**: Pattern for renaming files
-    """
+    """Download videos with enhanced security"""
     try:
+        # Validate request size
+        content_length = request.headers.get("content-length", 0)
+        if int(content_length) > SecurityConfig.MAX_CONTENT_LENGTH:
+            raise HTTPException(status_code=413, detail="Request too large")
+
         # Validate max_size
-        if max_size < 0:
-            raise HTTPException(status_code=400, detail="Max size must be a non-negative number")
+        if max_size < 0 or max_size > 10000:  # 10GB limit
+            raise HTTPException(status_code=400, detail="Invalid max size")
+
+        # Sanitize output directory
+        output_dir = sanitize_filename(output_dir)
+        
+        # Validate URLs
+        for url in urls:
+            if not validate_loom_url(url):
+                raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
 
         # Generate download ID
         download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -417,106 +599,6 @@ def get_password_hash(password: str, salt: bytes = None) -> tuple[str, str]:
 def verify_password(plain_password: str, hashed_password: str, salt: str) -> bool:
     peppered = plain_password + SecurityConfig.PEPPER
     return pwd_context.verify(peppered + salt, hashed_password)
-
-# Update the login endpoint
-@app.post("/token", response_model=Token)
-async def login(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    request: Request = None
-):
-    if rate_limiter.is_rate_limited(request.client.host, "login"):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests. Please try again later."
-        )
-
-    try:
-        user = authenticate_user(users_db, form_data.username, form_data.password)
-        if not user:
-            rate_limiter.record_login_attempt(form_data.username, False)
-            raise HTTPException(
-                status_code=401,
-                detail="Incorrect username or password",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        rate_limiter.record_login_attempt(form_data.username, True)
-        
-        # Generate tokens
-        access_token_expires = timedelta(minutes=SecurityConfig.ACCESS_TOKEN_EXPIRE_MINUTES)
-        refresh_token_expires = timedelta(days=SecurityConfig.REFRESH_TOKEN_EXPIRE_DAYS)
-        
-        access_token = create_access_token(
-            data={"sub": user.username, "role": user.role},
-            expires_delta=access_token_expires
-        )
-        
-        refresh_token = create_access_token(
-            data={"sub": user.username, "refresh": True},
-            expires_delta=refresh_token_expires
-        )
-
-        # Update last login
-        users_db[user.username].last_login = datetime.now()
-        
-        return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer"
-        }
-        
-    except Exception as e:
-        logging.error(f"Login error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-# Add refresh token endpoint
-@app.post("/token/refresh", response_model=Token)
-async def refresh_token(
-    current_token: str = Depends(oauth2_scheme),
-    request: Request = None
-):
-    if rate_limiter.is_rate_limited(request.client.host, "refresh"):
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests. Please try again later."
-        )
-
-    try:
-        payload = jwt.decode(
-            current_token, SecurityConfig.SECRET_KEY, algorithms=[SecurityConfig.ALGORITHM]
-        )
-        username: str = payload.get("sub")
-        is_refresh = payload.get("refresh", False)
-        
-        if not is_refresh:
-            raise HTTPException(status_code=400, detail="Not a refresh token")
-            
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-            
-        user = get_user(users_db, username)
-        if user is None:
-            raise HTTPException(status_code=401, detail="User not found")
-            
-        # Generate new tokens
-        access_token = create_access_token(
-            data={"sub": user.username, "role": user.role},
-            expires_delta=timedelta(minutes=SecurityConfig.ACCESS_TOKEN_EXPIRE_MINUTES)
-        )
-        
-        refresh_token = create_access_token(
-            data={"sub": user.username, "refresh": True},
-            expires_delta=timedelta(days=SecurityConfig.REFRESH_TOKEN_EXPIRE_DAYS)
-        )
-        
-        return {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer"
-        }
-        
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 def format_time(seconds: int) -> str:
     """Format seconds into human readable time."""
