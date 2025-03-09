@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, F
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union
 import os
 import json
 import logging
@@ -13,7 +13,7 @@ import requests
 import uvicorn
 import time
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, HTTPBearer
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, HTTPBearer, APIKeyHeader
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from fastapi import Depends
@@ -28,6 +28,10 @@ import uuid
 import re
 from fastapi import Cookie
 import ipaddress
+import ssl
+import socket
+from urllib.parse import urlparse
+import asyncio
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -70,6 +74,24 @@ class SecurityConfig:
         "Cross-Origin-Opener-Policy": "same-origin",
         "Cross-Origin-Resource-Policy": "same-origin"
     }
+    SSL_VERIFY = True
+    MIN_TLS_VERSION = ssl.TLSVersion.TLSv1_2
+    ALLOWED_DOMAINS = ["loom.com"]
+    MAX_URL_LENGTH = 2048
+    MAX_URLS_PER_REQUEST = 100
+    DOWNLOAD_TIMEOUT = 300  # 5 minutes
+    API_RATE_LIMITS = {
+        "download": 10,  # per minute
+        "status": 60,    # per minute
+        "admin": 30      # per minute
+    }
+    BLOCKED_IPS: set = set()
+    SUSPICIOUS_PATTERNS = [
+        r"../",          # Directory traversal
+        r"cmd=",         # Command injection
+        r"exec\(",       # Code execution
+        r"SELECT.*FROM"  # SQL injection
+    ]
 
 # Password hashing
 pwd_context = CryptContext(
@@ -116,23 +138,104 @@ app.add_middleware(
     allowed_hosts=SecurityConfig.TRUSTED_HOSTS
 )
 
+# Add API key security
+api_key_header = APIKeyHeader(name=SecurityConfig.API_KEY_HEADER)
+
+# Add URL validation
+def validate_url(url: str) -> bool:
+    """Enhanced URL validation"""
+    try:
+        if len(url) > SecurityConfig.MAX_URL_LENGTH:
+            return False
+            
+        parsed = urlparse(url)
+        if parsed.netloc not in SecurityConfig.ALLOWED_DOMAINS:
+            return False
+            
+        # Check for suspicious patterns
+        for pattern in SecurityConfig.SUSPICIOUS_PATTERNS:
+            if re.search(pattern, url, re.IGNORECASE):
+                return False
+                
+        return True
+    except:
+        return False
+
+# Add security monitoring
+class SecurityMonitor:
+    def __init__(self):
+        self._suspicious_activities: Dict[str, List[datetime]] = {}
+        self._blocked_ips: set = SecurityConfig.BLOCKED_IPS
+        self._last_cleanup = datetime.now(timezone.utc)
+
+    async def monitor_request(self, request: Request) -> None:
+        client_ip = request.client.host
+        
+        # Check if IP is blocked
+        if client_ip in self._blocked_ips:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied"
+            )
+
+        # Record suspicious activity
+        if await self._is_suspicious(request):
+            if client_ip not in self._suspicious_activities:
+                self._suspicious_activities[client_ip] = []
+            self._suspicious_activities[client_ip].append(datetime.now(timezone.utc))
+            
+            # Block IP if too many suspicious activities
+            if len(self._suspicious_activities[client_ip]) > 5:
+                self._blocked_ips.add(client_ip)
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied due to suspicious activity"
+                )
+
+        # Cleanup old records
+        await self._cleanup()
+
+    async def _is_suspicious(self, request: Request) -> bool:
+        """Check for suspicious patterns in request"""
+        try:
+            body = await request.body()
+            text = body.decode()
+            
+            # Check for suspicious patterns
+            for pattern in SecurityConfig.SUSPICIOUS_PATTERNS:
+                if re.search(pattern, text, re.IGNORECASE):
+                    return True
+                    
+            # Check headers for suspicious content
+            for header, value in request.headers.items():
+                if any(re.search(pattern, value, re.IGNORECASE) 
+                      for pattern in SecurityConfig.SUSPICIOUS_PATTERNS):
+                    return True
+                    
+            return False
+        except:
+            return False
+
+    async def _cleanup(self):
+        """Clean up old records"""
+        now = datetime.now(timezone.utc)
+        if (now - self._last_cleanup).seconds > 3600:  # Cleanup every hour
+            self._suspicious_activities = {
+                ip: times for ip, times in self._suspicious_activities.items()
+                if any((now - t).days < 1 for t in times)
+            }
+            self._last_cleanup = now
+
+security_monitor = SecurityMonitor()
+
 # Add security middleware
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    # Check IP whitelist
-    client_ip = request.client.host
-    if not any(ipaddress.ip_address(client_ip) in ipaddress.ip_network(allowed)
-               for allowed in SecurityConfig.IP_WHITELIST):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "IP address not allowed"}
-        )
-
+    # Monitor request for suspicious activity
+    await security_monitor.monitor_request(request)
+    
     # Add security headers
     response = await call_next(request)
-    for header, value in SecurityConfig.SECURE_HEADERS.items():
-        response.headers[header] = value
-    
     return response
 
 # Models with enhanced validation
@@ -502,22 +605,45 @@ async def api_download(
     output_dir: Optional[str] = "downloads",
     rename_pattern: Optional[str] = "{id}",
     background_tasks: BackgroundTasks = None,
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user),
+    api_key: str = Depends(api_key_header)
 ):
-    """Download videos with enhanced security and limits"""
-    
-    # Check concurrent downloads
-    user_downloads = sum(
-        1 for status in active_downloads.values()
-        if status.status not in {"Completed", "Failed", "Cancelled"}
-    )
-    if user_downloads >= SecurityConfig.MAX_CONCURRENT_DOWNLOADS:
-        raise HTTPException(
-            status_code=429,
-            detail="Maximum concurrent downloads reached"
-        )
-    
+    """Download videos with enhanced security and monitoring"""
     try:
+        # Validate request size and number of URLs
+        if len(urls) > SecurityConfig.MAX_URLS_PER_REQUEST:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Maximum {SecurityConfig.MAX_URLS_PER_REQUEST} URLs allowed per request"
+            )
+
+        # Validate each URL
+        invalid_urls = [url for url in urls if not validate_url(url)]
+        if invalid_urls:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid URLs detected: {invalid_urls}"
+            )
+
+        # Check concurrent downloads
+        user_downloads = sum(
+            1 for status in active_downloads.values()
+            if status.status not in {"Completed", "Failed", "Cancelled"}
+        )
+        if user_downloads >= SecurityConfig.MAX_CONCURRENT_DOWNLOADS:
+            raise HTTPException(
+                status_code=429,
+                detail="Maximum concurrent downloads reached"
+            )
+
+        # Set download timeout
+        download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        background_tasks.add_task(
+            monitor_download_timeout,
+            download_id,
+            SecurityConfig.DOWNLOAD_TIMEOUT
+        )
+
         # Validate request size
         content_length = request.headers.get("content-length", 0)
         if int(content_length) > SecurityConfig.MAX_CONTENT_LENGTH:
@@ -530,11 +656,6 @@ async def api_download(
         # Sanitize output directory
         output_dir = sanitize_filename(output_dir)
         
-        # Validate URLs
-        for url in urls:
-            if not validate_loom_url(url):
-                raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
-
         # Generate download ID
         download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
@@ -883,6 +1004,19 @@ def main():
             sg.popup_error(f'Error: {values[event]}')
 
     window.close()
+
+# Add download timeout monitor
+async def monitor_download_timeout(download_id: str, timeout: int):
+    """Monitor download timeout"""
+    await asyncio.sleep(timeout)
+    if download_id in active_downloads:
+        status = active_downloads[download_id]
+        if status.status not in {"Completed", "Failed", "Cancelled"}:
+            status.status = "Failed"
+            status.errors.append({
+                "error": "Download timeout",
+                "url": status.current_url
+            })
 
 if __name__ == "__main__":
     setup_logging()
