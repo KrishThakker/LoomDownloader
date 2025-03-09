@@ -95,8 +95,8 @@ class UserInDB(User):
 # Mock user database - Replace with real database in production
 users_db = {
     "admin": {
-        "username": "admin",
-        "hashed_password": pwd_context.hash("admin123"),  # Change in production
+        "username": "root",
+        "hashed_password": pwd_context.hash("admin123*"),  # Change in production
         "disabled": False
     }
 }
