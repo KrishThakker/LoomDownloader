@@ -43,6 +43,14 @@ from prometheus_client import Counter, Histogram, start_http_server
 import functools
 from typing import Callable
 import traceback
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from fastapi_versioning import VersionedFastAPI, version
+from celery import Celery
+from redis import Redis
+import aioredis
+import asyncpg
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -1126,6 +1134,177 @@ async def stream_download(
     except Exception as e:
         logging.error(f"Streaming error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# Database configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/loom_downloader")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost")
+
+# Initialize database
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Initialize Redis
+redis = Redis.from_url(REDIS_URL)
+
+# Initialize Celery
+celery_app = Celery('tasks', broker=REDIS_URL)
+
+# Database models
+class Download(Base):
+    __tablename__ = "downloads"
+
+    id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.id"))
+    status = Column(String)
+    urls = Column(JSON)
+    created_at = Column(DateTime(timezone=True))
+    updated_at = Column(DateTime(timezone=True))
+    metadata = Column(JSON)
+    errors = Column(JSON)
+
+    user = relationship("DBUser", back_populates="downloads")
+
+class DBUser(Base):
+    __tablename__ = "users"
+
+    id = Column(String, primary_key=True)
+    username = Column(String, unique=True)
+    hashed_password = Column(String)
+    salt = Column(String)
+    role = Column(String)
+    created_at = Column(DateTime(timezone=True))
+    last_login = Column(DateTime(timezone=True))
+    downloads = relationship("Download", back_populates="user")
+
+# Create database tables
+Base.metadata.create_all(bind=engine)
+
+# Database dependency
+async def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Redis pool
+async def get_redis_pool():
+    return await aioredis.create_redis_pool(REDIS_URL)
+
+# Background tasks with Celery
+@celery_app.task
+def process_download(download_id: str, urls: List[str], user_id: str):
+    try:
+        # Process download in background
+        with SessionLocal() as db:
+            download = Download(
+                id=download_id,
+                user_id=user_id,
+                status="processing",
+                urls=urls,
+                created_at=datetime.now(timezone.utc)
+            )
+            db.add(download)
+            db.commit()
+
+            # Process downloads
+            for url in urls:
+                try:
+                    # Download logic here
+                    pass
+                except Exception as e:
+                    download.errors = download.errors or []
+                    download.errors.append({"url": url, "error": str(e)})
+
+            download.status = "completed"
+            download.updated_at = datetime.now(timezone.utc)
+            db.commit()
+
+    except Exception as e:
+        logging.error(f"Background task error: {e}")
+        with SessionLocal() as db:
+            download = db.query(Download).filter(Download.id == download_id).first()
+            if download:
+                download.status = "failed"
+                download.errors = [{"error": str(e)}]
+                download.updated_at = datetime.now(timezone.utc)
+                db.commit()
+
+# API versioning
+@app.post("/api/v2/download")
+@version(2)
+async def api_download_v2(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    redis: Redis = Depends(get_redis_pool)
+):
+    """Version 2 of download API with enhanced features"""
+    try:
+        # Validate request
+        download_id = str(uuid.uuid4())
+        
+        # Store in database
+        download = Download(
+            id=download_id,
+            user_id=current_user.id,
+            status="queued",
+            urls=request.urls,
+            created_at=datetime.now(timezone.utc)
+        )
+        db.add(download)
+        db.commit()
+
+        # Queue background task
+        process_download.delay(download_id, request.urls, current_user.id)
+
+        # Cache initial status
+        await redis.set(
+            f"download:{download_id}",
+            json.dumps({"status": "queued", "progress": 0}),
+            expire=3600
+        )
+
+        return {
+            "status": "queued",
+            "download_id": download_id,
+            "message": "Download queued for processing"
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add database cleanup task
+@celery_app.task
+def cleanup_old_downloads():
+    """Clean up old downloads from database"""
+    try:
+        with SessionLocal() as db:
+            # Delete downloads older than 30 days
+            threshold = datetime.now(timezone.utc) - timedelta(days=30)
+            db.query(Download).filter(Download.created_at < threshold).delete()
+            db.commit()
+    except Exception as e:
+        logging.error(f"Cleanup task error: {e}")
+
+# Schedule cleanup task
+celery_app.conf.beat_schedule = {
+    'cleanup-old-downloads': {
+        'task': 'tasks.cleanup_old_downloads',
+        'schedule': 86400.0,  # Daily
+    },
+}
+
+# Add API versioning middleware
+app = VersionedFastAPI(app,
+    version_format='{major}',
+    prefix_format='/v{major}',
+    default_version=(1, 0),
+    enable_latest=True
+)
 
 if __name__ == "__main__":
     setup_logging()
