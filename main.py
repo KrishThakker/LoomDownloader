@@ -1306,6 +1306,203 @@ app = VersionedFastAPI(app,
     enable_latest=True
 )
 
+# Add enhanced logging configuration
+class LogConfig:
+    LOGGER_NAME = "loom_downloader"
+    LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+    LOG_LEVEL = "INFO"
+    LOG_FILE = "app.log"
+    MAX_LOG_SIZE = 10 * 1024 * 1024  # 10MB
+    BACKUP_COUNT = 5
+
+    @classmethod
+    def setup(cls):
+        logger = logging.getLogger(cls.LOGGER_NAME)
+        logger.setLevel(cls.LOG_LEVEL)
+
+        # Console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter(cls.LOG_FORMAT))
+        logger.addHandler(console_handler)
+
+        # Rotating file handler
+        file_handler = logging.handlers.RotatingFileHandler(
+            cls.LOG_FILE,
+            maxBytes=cls.MAX_LOG_SIZE,
+            backupCount=cls.BACKUP_COUNT
+        )
+        file_handler.setFormatter(logging.Formatter(cls.LOG_FORMAT))
+        logger.addHandler(file_handler)
+
+        return logger
+
+logger = LogConfig.setup()
+
+# Add API response models
+class APIResponse(BaseModel):
+    status: str
+    message: str
+    data: Optional[Dict] = None
+    errors: Optional[List[Dict]] = None
+
+# Add error handling middleware
+@app.middleware("http")
+async def error_handling_middleware(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error(f"Unhandled error: {str(e)}", exc_info=True)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=APIResponse(
+                status="error",
+                message="Internal server error",
+                errors=[{"detail": str(e)}]
+            ).dict()
+        )
+
+# Add rate limiting decorator
+def rate_limit(limit: int, window: int = 60):
+    def decorator(func):
+        requests = {}
+        
+        async def wrapper(*args, request: Request, **kwargs):
+            now = datetime.now(timezone.utc)
+            client_ip = request.client.host
+            key = f"{client_ip}:{func.__name__}"
+            
+            # Clean old requests
+            if key in requests:
+                requests[key] = [t for t in requests[key] if now - t < timedelta(seconds=window)]
+            else:
+                requests[key] = []
+                
+            if len(requests[key]) >= limit:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail=f"Rate limit exceeded. Try again in {window} seconds."
+                )
+                
+            requests[key].append(now)
+            return await func(*args, request=request, **kwargs)
+            
+        return wrapper
+    return decorator
+
+# Add new API endpoints
+@app.get("/api/v1/status", response_model=APIResponse)
+@rate_limit(limit=60)
+async def get_system_status(request: Request):
+    """Get system status and statistics"""
+    try:
+        stats = {
+            "active_downloads": len(active_downloads),
+            "system": {
+                "cpu_percent": psutil.cpu_percent(),
+                "memory_percent": psutil.virtual_memory().percent,
+                "disk_usage": psutil.disk_usage('/').percent
+            },
+            "cache": {
+                "url_cache_size": len(cache_manager.url_cache),
+                "file_cache_size": len(cache_manager.download_cache)
+            }
+        }
+        
+        return APIResponse(
+            status="success",
+            message="System status retrieved",
+            data=stats
+        )
+    except Exception as e:
+        logger.error(f"Error getting system status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/api/v1/downloads/{download_id}", response_model=APIResponse)
+@rate_limit(limit=10)
+async def cancel_download(
+    download_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """Cancel an active download"""
+    try:
+        if download_id not in active_downloads:
+            raise HTTPException(status_code=404, detail="Download not found")
+            
+        status = active_downloads[download_id]
+        status.status = "Cancelled"
+        await file_manager.cleanup_download(download_id)
+        
+        return APIResponse(
+            status="success",
+            message=f"Download {download_id} cancelled",
+            data={"download_id": download_id}
+        )
+    except Exception as e:
+        logger.error(f"Error cancelling download: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/downloads/history", response_model=APIResponse)
+@rate_limit(limit=30)
+async def get_download_history(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    limit: int = 10,
+    offset: int = 0
+):
+    """Get download history for current user"""
+    try:
+        history = list(download_manager.download_history.values())
+        history.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        return APIResponse(
+            status="success",
+            message="Download history retrieved",
+            data={
+                "total": len(history),
+                "items": history[offset:offset + limit]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting download history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Update startup event
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    try:
+        # Initialize configurations
+        AppConfig.initialize()
+        
+        # Start background tasks
+        asyncio.create_task(periodic_cleanup())
+        asyncio.create_task(monitor_system_health())
+        
+        logger.info("Application started successfully")
+    except Exception as e:
+        logger.error(f"Error during startup: {e}")
+        raise
+
+# Add periodic health monitoring
+async def monitor_system_health():
+    """Monitor system health periodically"""
+    while True:
+        try:
+            # Check system resources
+            if psutil.virtual_memory().percent > 90:
+                logger.warning("High memory usage detected")
+            if psutil.cpu_percent() > 80:
+                logger.warning("High CPU usage detected")
+            if psutil.disk_usage('/').percent > 90:
+                logger.warning("Low disk space detected")
+                
+            await asyncio.sleep(SecurityConfig.HEALTH_CHECK_INTERVAL)
+        except Exception as e:
+            logger.error(f"Error monitoring system health: {e}")
+            await asyncio.sleep(60)
+
 if __name__ == "__main__":
     setup_logging()
     main()
