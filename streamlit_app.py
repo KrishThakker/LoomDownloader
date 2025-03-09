@@ -69,7 +69,7 @@ def main():
     
     # Page configuration
     st.set_page_config(
-        page_title="Téléchargeur de Vidéos Loom",
+        page_title="Téléchargeur de fichiers Loom",
         page_icon="🎥",
         layout="wide",
         initial_sidebar_state="expanded"
