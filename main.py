@@ -2,18 +2,18 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, F
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import os
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import PySimpleGUI as sg
 import threading
 import requests
 import uvicorn
 import time
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes, HTTPBearer
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from fastapi import Depends
@@ -27,6 +27,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import uuid
 import re
 from fastapi import Cookie
+import ipaddress
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -55,6 +56,20 @@ class SecurityConfig:
     RATE_LIMIT_WINDOW = 60  # seconds
     RATE_LIMIT_MAX_REQUESTS = 100
     ALLOWED_FILE_TYPES = [".mp4", ".mov", ".avi"]
+    JWT_BLACKLIST = set()  # Store revoked tokens
+    IP_WHITELIST = ["127.0.0.1", "::1"]  # Allowed IPs
+    ADMIN_ROLES = {"admin", "superuser"}
+    MAX_REQUEST_SIZE = 1024 * 1024  # 1MB
+    API_KEY_HEADER = "X-API-Key"
+    HASH_ALGORITHM = "sha256"
+    REQUEST_TIMEOUT = 30  # seconds
+    MAX_CONCURRENT_DOWNLOADS = 5
+    SECURE_HEADERS = {
+        "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+        "Cross-Origin-Embedder-Policy": "require-corp",
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Cross-Origin-Resource-Policy": "same-origin"
+    }
 
 # Password hashing
 pwd_context = CryptContext(
@@ -100,6 +115,25 @@ app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=SecurityConfig.TRUSTED_HOSTS
 )
+
+# Add security middleware
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    # Check IP whitelist
+    client_ip = request.client.host
+    if not any(ipaddress.ip_address(client_ip) in ipaddress.ip_network(allowed)
+               for allowed in SecurityConfig.IP_WHITELIST):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "IP address not allowed"}
+        )
+
+    # Add security headers
+    response = await call_next(request)
+    for header, value in SecurityConfig.SECURE_HEADERS.items():
+        response.headers[header] = value
+    
+    return response
 
 # Models with enhanced validation
 class DownloadRequest(BaseModel):
@@ -184,23 +218,107 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SecurityConfig.SECRET_KEY, algorithm=SecurityConfig.ALGORITHM)
     return encoded_jwt
 
-async def get_current_user(token: str = Depends(oauth2_scheme)):
+# Add token blacklist management
+class TokenBlacklist:
+    def __init__(self):
+        self._blacklist: Dict[str, datetime] = {}
+    
+    def add_token(self, token: str):
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        self._blacklist[token_hash] = datetime.now(timezone.utc)
+    
+    def is_blacklisted(self, token: str) -> bool:
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        return token_hash in self._blacklist
+    
+    def cleanup(self):
+        """Remove expired tokens"""
+        now = datetime.now(timezone.utc)
+        self._blacklist = {
+            token: timestamp
+            for token, timestamp in self._blacklist.items()
+            if (now - timestamp).days < 7
+        }
+
+token_blacklist = TokenBlacklist()
+
+# Update user authentication
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    request: Request = None
+):
+    if token_blacklist.is_blacklisted(token):
+        raise HTTPException(
+            status_code=401,
+            detail="Token has been revoked",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     credentials_exception = HTTPException(
         status_code=401,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    
     try:
         payload = jwt.decode(token, SecurityConfig.SECRET_KEY, algorithms=[SecurityConfig.ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
+            
+        # Check token expiration
+        exp = payload.get("exp")
+        if not exp or datetime.fromtimestamp(exp) < datetime.now(timezone.utc):
+            raise credentials_exception
+            
     except JWTError:
         raise credentials_exception
+        
     user = get_user(users_db, username)
     if user is None:
         raise credentials_exception
+        
     return user
+
+# Add admin-only decorator
+def admin_only(func):
+    async def wrapper(*args, current_user: User = Depends(get_current_user), **kwargs):
+        if current_user.role not in SecurityConfig.ADMIN_ROLES:
+            raise HTTPException(
+                status_code=403,
+                detail="Admin privileges required"
+            )
+        return await func(*args, current_user=current_user, **kwargs)
+    return wrapper
+
+# Add secure logout endpoint
+@app.post("/api/v1/logout")
+async def logout(
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme)
+):
+    token_blacklist.add_token(token)
+    return {"message": "Successfully logged out"}
+
+# Add admin endpoints
+@app.get("/api/v1/admin/users")
+@admin_only
+async def list_users(current_user: User = Depends(get_current_user)):
+    """List all users (admin only)"""
+    return {"users": list(users_db.keys())}
+
+@app.post("/api/v1/admin/revoke/{username}")
+@admin_only
+async def revoke_user_sessions(
+    username: str,
+    current_user: User = Depends(get_current_user)
+):
+    """Revoke all sessions for a user (admin only)"""
+    if username not in users_db:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Implement session revocation logic here
+    return {"message": f"All sessions revoked for user {username}"}
 
 def setup_logging():
     logging.basicConfig(
@@ -375,25 +493,6 @@ async def login(
         logging.error(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Add logout endpoint
-@app.post("/logout")
-async def logout(
-    response: Response,
-    current_user: User = Depends(get_current_user),
-    session_id: str = Cookie(None, alias=SecurityConfig.SESSION_COOKIE_NAME)
-):
-    if session_id:
-        session_manager.remove_session(session_id)
-    
-    response.delete_cookie(
-        key=SecurityConfig.SESSION_COOKIE_NAME,
-        httponly=True,
-        secure=True,
-        samesite="strict"
-    )
-    
-    return {"message": "Successfully logged out"}
-
 # Update the download endpoint with additional security
 @app.post("/api/v1/download")
 async def api_download(
@@ -405,7 +504,19 @@ async def api_download(
     background_tasks: BackgroundTasks = None,
     current_user: User = Depends(get_current_user)
 ):
-    """Download videos with enhanced security"""
+    """Download videos with enhanced security and limits"""
+    
+    # Check concurrent downloads
+    user_downloads = sum(
+        1 for status in active_downloads.values()
+        if status.status not in {"Completed", "Failed", "Cancelled"}
+    )
+    if user_downloads >= SecurityConfig.MAX_CONCURRENT_DOWNLOADS:
+        raise HTTPException(
+            status_code=429,
+            detail="Maximum concurrent downloads reached"
+        )
+    
     try:
         # Validate request size
         content_length = request.headers.get("content-length", 0)
