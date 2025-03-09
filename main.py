@@ -114,6 +114,10 @@ async def root():
 
 @app.post("/api/download")
 async def start_download(request: DownloadRequest, background_tasks: BackgroundTasks):
+    # Validate max_size
+    if request.max_size < 0:
+        raise HTTPException(status_code=400, detail="Max size must be a non-negative number.")
+    
     download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Initialize download status
