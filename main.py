@@ -1503,6 +1503,175 @@ async def monitor_system_health():
             logger.error(f"Error monitoring system health: {e}")
             await asyncio.sleep(60)
 
+# Add new batch operations endpoint
+@app.post("/api/v1/batch", response_model=APIResponse)
+@rate_limit(limit=10)
+async def batch_operation(
+    request: Request,
+    operation: str,
+    download_ids: List[str],
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Perform batch operations on multiple downloads
+    Operations: cancel, retry, delete, pause, resume
+    """
+    try:
+        results = []
+        failed = []
+        
+        for download_id in download_ids:
+            try:
+                if download_id not in active_downloads:
+                    failed.append({
+                        "id": download_id,
+                        "error": "Download not found"
+                    })
+                    continue
+                    
+                status = active_downloads[download_id]
+                
+                if operation == "cancel":
+                    status.status = "Cancelled"
+                    await file_manager.cleanup_download(download_id)
+                elif operation == "retry":
+                    if status.status in ["Failed", "Cancelled"]:
+                        # Reset status and retry download
+                        status.status = "Retrying"
+                        status.failed = 0
+                        status.errors = []
+                        background_tasks.add_task(
+                            download_manager.start_download,
+                            download_id,
+                            status.urls
+                        )
+                elif operation == "delete":
+                    await file_manager.cleanup_download(download_id)
+                    del active_downloads[download_id]
+                elif operation == "pause":
+                    if status.status == "In Progress":
+                        status.status = "Paused"
+                elif operation == "resume":
+                    if status.status == "Paused":
+                        status.status = "Resuming"
+                        background_tasks.add_task(
+                            download_manager.resume_download,
+                            download_id
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Invalid operation: {operation}"
+                    )
+                
+                # Log the operation
+                logger.info(f"Batch {operation} performed on download {download_id}")
+                results.append({
+                    "id": download_id,
+                    "status": "success",
+                    "new_status": status.status
+                })
+                
+                # Update database if needed
+                if db:
+                    download = db.query(Download).filter(Download.id == download_id).first()
+                    if download:
+                        download.status = status.status
+                        download.updated_at = datetime.now(timezone.utc)
+                        db.commit()
+                
+            except Exception as e:
+                logger.error(f"Error in batch operation for {download_id}: {e}")
+                failed.append({
+                    "id": download_id,
+                    "error": str(e)
+                })
+        
+        return APIResponse(
+            status="success" if not failed else "partial_success",
+            message=f"Batch {operation} completed",
+            data={
+                "successful": results,
+                "failed": failed,
+                "total_processed": len(download_ids),
+                "success_count": len(results),
+                "failure_count": len(failed)
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Batch operation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add detailed status endpoint
+@app.get("/api/v1/downloads/stats", response_model=APIResponse)
+@rate_limit(limit=30)
+async def get_download_stats(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    time_range: str = "24h"  # Options: 24h, 7d, 30d, all
+):
+    """Get detailed download statistics"""
+    try:
+        now = datetime.now(timezone.utc)
+        
+        # Calculate time threshold based on range
+        if time_range == "24h":
+            threshold = now - timedelta(hours=24)
+        elif time_range == "7d":
+            threshold = now - timedelta(days=7)
+        elif time_range == "30d":
+            threshold = now - timedelta(days=30)
+        else:  # all
+            threshold = datetime.min.replace(tzinfo=timezone.utc)
+            
+        # Filter history by time range
+        filtered_history = [
+            entry for entry in download_manager.download_history.values()
+            if entry["timestamp"] >= threshold
+        ]
+        
+        # Calculate statistics
+        total_downloads = len(filtered_history)
+        successful = sum(1 for entry in filtered_history 
+                        if entry["status"]["status"] == "Completed")
+        failed = sum(1 for entry in filtered_history 
+                    if entry["status"]["status"] == "Failed")
+        cancelled = sum(1 for entry in filtered_history 
+                       if entry["status"]["status"] == "Cancelled")
+        
+        # Calculate average speed and size
+        speeds = [entry["status"].get("speed", 0) for entry in filtered_history]
+        avg_speed = sum(speeds) / len(speeds) if speeds else 0
+        
+        return APIResponse(
+            status="success",
+            message="Download statistics retrieved",
+            data={
+                "time_range": time_range,
+                "total_downloads": total_downloads,
+                "statistics": {
+                    "successful": successful,
+                    "failed": failed,
+                    "cancelled": cancelled,
+                    "success_rate": (successful / total_downloads * 100) if total_downloads > 0 else 0
+                },
+                "performance": {
+                    "average_speed": f"{avg_speed:.2f} MB/s",
+                    "active_downloads": len(active_downloads),
+                    "peak_concurrent": download_manager.peak_concurrent_downloads
+                },
+                "errors": {
+                    "most_common": download_manager.get_most_common_errors(limit=5)
+                }
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting download stats: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     setup_logging()
     main()
