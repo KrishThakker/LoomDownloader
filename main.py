@@ -23,8 +23,8 @@ DEFAULT_PORT = 8000
 DEFAULT_HOST = '0.0.0.0'
 
 app = FastAPI(
-    title="Loom Video Downloader API",
-    description="API for downloading Loom videos",
+    title="Loom Video Downloader",
+    description="Download Loom videos easily",
     version="1.0.0"
 )
 
@@ -140,7 +140,7 @@ async def api_download(
     try:
         # Validate max_size
         if max_size < 0:
-            raise HTTPException(status_code=400, detail="Max size must be a number above zero.")
+            raise HTTPException(status_code=400, detail="Max size must be a non-negative number")
 
         # Generate download ID
         download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -164,7 +164,7 @@ async def api_download(
             output_dir
         )
         
-        logging.info(f"API Download started: {download_id} with {len(urls)} URLs.")
+        logging.info(f"API Download started: {download_id} with {len(urls)} URLs")
         
         return {
             "status": "success",
