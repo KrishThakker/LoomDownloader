@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, Form, Request, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Set, Tuple
 import os
 import json
 import logging
@@ -32,6 +32,9 @@ import ssl
 import socket
 from urllib.parse import urlparse
 import asyncio
+import aiohttp
+import aiofile
+import psutil
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -92,6 +95,19 @@ class SecurityConfig:
         r"exec\(",       # Code execution
         r"SELECT.*FROM"  # SQL injection
     ]
+    ENCRYPTION_KEY = Fernet.generate_key()
+    SENSITIVE_HEADERS = {'authorization', 'cookie', 'proxy-authorization'}
+    FILE_SIZE_LIMIT = 1024 * 1024 * 1024  # 1GB
+    ALLOWED_MIME_TYPES = {'video/mp4', 'video/quicktime', 'video/x-msvideo'}
+    SCAN_DOWNLOADS = True
+    PROXY_SETTINGS = {
+        'http': os.getenv('HTTP_PROXY'),
+        'https': os.getenv('HTTPS_PROXY')
+    }
+    DOWNLOAD_CHUNK_SIZE = 8192  # 8KB chunks
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1  # seconds
+    HEALTH_CHECK_INTERVAL = 300  # 5 minutes
 
 # Password hashing
 pwd_context = CryptContext(
@@ -265,6 +281,8 @@ class DownloadStatus(BaseModel):
     errors: List[dict] = []
     speed: Optional[float] = 0  # Download speed in MB/s
     eta: Optional[int] = None   # Estimated time remaining in seconds
+    start_time: Optional[datetime] = None
+    end_time: Optional[datetime] = None
 
 # Store download status
 active_downloads = {}
@@ -596,7 +614,147 @@ async def login(
         logging.error(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-# Update the download endpoint with additional security
+# Add download manager
+class DownloadManager:
+    def __init__(self):
+        self.active_downloads: Dict[str, DownloadStatus] = {}
+        self.download_history: Dict[str, List[Dict[str, Any]]] = {}
+        self.encryption = Fernet(SecurityConfig.ENCRYPTION_KEY)
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+
+    async def start_download(self, download_id: str, urls: List[str], **kwargs) -> None:
+        try:
+            status = DownloadStatus(
+                id=download_id,
+                total=len(urls),
+                completed=0,
+                failed=0,
+                status="Starting",
+                start_time=datetime.now(timezone.utc)
+            )
+            self.active_downloads[download_id] = status
+            
+            async with aiohttp.ClientSession() as session:
+                for url in urls:
+                    if status.status == "Cancelled":
+                        break
+                        
+                    status.current_url = url
+                    try:
+                        await self._download_file(session, url, status, **kwargs)
+                    except Exception as e:
+                        status.failed += 1
+                        status.errors.append({"url": url, "error": str(e)})
+                        
+            status.status = "Completed" if status.failed == 0 else "Completed with errors"
+            status.end_time = datetime.now(timezone.utc)
+            
+            # Store download history
+            self.download_history[download_id] = {
+                "status": status.dict(),
+                "timestamp": datetime.now(timezone.utc)
+            }
+            
+        except Exception as e:
+            logging.error(f"Download error: {str(e)}")
+            status.status = f"Failed: {str(e)}"
+
+    async def _download_file(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        status: DownloadStatus,
+        **kwargs
+    ) -> None:
+        retries = 0
+        while retries < SecurityConfig.MAX_RETRIES:
+            try:
+                async with session.get(url, proxy=SecurityConfig.PROXY_SETTINGS) as response:
+                    if response.status != 200:
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail=f"Failed to download: HTTP {response.status}"
+                        )
+                    
+                    # Check content type and size
+                    content_type = response.headers.get('content-type', '')
+                    if content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Invalid content type: {content_type}"
+                        )
+                    
+                    content_length = int(response.headers.get('content-length', 0))
+                    if content_length > SecurityConfig.FILE_SIZE_LIMIT:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="File too large"
+                        )
+                    
+                    # Download file in chunks
+                    filename = os.path.join(kwargs['output_dir'], f"{status.id}.mp4")
+                    async with aiofile.async_open(filename, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(SecurityConfig.DOWNLOAD_CHUNK_SIZE):
+                            if status.status == "Cancelled":
+                                return
+                            await f.write(chunk)
+                    
+                    # Scan downloaded file if enabled
+                    if SecurityConfig.SCAN_DOWNLOADS:
+                        await self._scan_file(filename)
+                    
+                    status.completed += 1
+                    return
+                    
+            except Exception as e:
+                retries += 1
+                if retries < SecurityConfig.MAX_RETRIES:
+                    await asyncio.sleep(SecurityConfig.RETRY_DELAY)
+                else:
+                    raise e
+
+    async def _scan_file(self, filename: str) -> None:
+        """Implement virus scanning here"""
+        pass
+
+    async def _periodic_cleanup(self) -> None:
+        """Cleanup old downloads periodically"""
+        while True:
+            try:
+                now = datetime.now(timezone.utc)
+                # Clean up old downloads
+                self.active_downloads = {
+                    id: status for id, status in self.active_downloads.items()
+                    if (now - status.start_time).days < 1
+                }
+                # Clean up old history
+                self.download_history = {
+                    id: history for id, history in self.download_history.items()
+                    if (now - history["timestamp"]).days < 7
+                }
+                await asyncio.sleep(3600)  # Clean up every hour
+            except Exception as e:
+                logging.error(f"Cleanup error: {str(e)}")
+                await asyncio.sleep(60)
+
+download_manager = DownloadManager()
+
+# Add health check endpoint
+@app.get("/health")
+async def health_check():
+    """Check system health"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc),
+        "active_downloads": len(download_manager.active_downloads),
+        "system_info": {
+            "memory_usage": psutil.Process().memory_info().rss / 1024 / 1024,
+            "cpu_usage": psutil.cpu_percent(),
+            "disk_usage": psutil.disk_usage('/').percent
+        }
+    }
+
+# Update download endpoint
 @app.post("/api/v1/download")
 async def api_download(
     request: Request,
@@ -639,56 +797,24 @@ async def api_download(
         # Set download timeout
         download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         background_tasks.add_task(
-            monitor_download_timeout,
-            download_id,
-            SecurityConfig.DOWNLOAD_TIMEOUT
-        )
-
-        # Validate request size
-        content_length = request.headers.get("content-length", 0)
-        if int(content_length) > SecurityConfig.MAX_CONTENT_LENGTH:
-            raise HTTPException(status_code=413, detail="Request too large")
-
-        # Validate max_size
-        if max_size < 0 or max_size > 10000:  # 10GB limit
-            raise HTTPException(status_code=400, detail="Invalid max size")
-
-        # Sanitize output directory
-        output_dir = sanitize_filename(output_dir)
-        
-        # Generate download ID
-        download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Initialize download status
-        status = DownloadStatus(
-            id=download_id,
-            total=len(urls),
-            completed=0,
-            failed=0,
-            status="Starting"
-        )
-        active_downloads[download_id] = status
-        
-        # Start download in background
-        background_tasks.add_task(
-            process_downloads,
+            download_manager.start_download,
             download_id,
             urls,
-            max_size,
-            output_dir
+            max_size=max_size,
+            output_dir=output_dir,
+            rename_pattern=rename_pattern
         )
         
         logging.info(f"API Download started: {download_id} with {len(urls)} URLs")
         
         return {
             "status": "success",
-            "message": "Download started",
             "download_id": download_id,
-            "total_urls": len(urls)
+            "message": "Download started"
         }
         
     except Exception as e:
-        logging.error(f"API Download error: {str(e)}")
+        logging.error(f"Download error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/downloads")
