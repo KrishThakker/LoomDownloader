@@ -6,13 +6,17 @@ from typing import List, Optional, Dict
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import PySimpleGUI as sg
 import threading
 import requests
 import uvicorn
 import time
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from fastapi import Depends
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -21,6 +25,15 @@ from loom_downloader import fetch_loom_download_url, download_loom_video, extrac
 WINDOW_THEME = 'LightGrey1'
 DEFAULT_PORT = 8000
 DEFAULT_HOST = '0.0.0.0'
+
+# Security constants
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")  # Change in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(
     title="Loom Video Downloader",
@@ -70,6 +83,67 @@ class DownloadStatus(BaseModel):
 
 # Store download status
 active_downloads = {}
+
+# User model
+class User(BaseModel):
+    username: str
+    disabled: Optional[bool] = None
+
+class UserInDB(User):
+    hashed_password: str
+
+# Mock user database - Replace with real database in production
+users_db = {
+    "admin": {
+        "username": "admin",
+        "hashed_password": pwd_context.hash("admin123"),  # Change in production
+        "disabled": False
+    }
+}
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_user(db, username: str):
+    if username in db:
+        user_dict = db[username]
+        return UserInDB(**user_dict)
+
+def authenticate_user(db, username: str, password: str):
+    user = get_user(db, username)
+    if not user:
+        return False
+    if not verify_password(password, user.hashed_password):
+        return False
+    return user
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=401,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(users_db, username)
+    if user is None:
+        raise credentials_exception
+    return user
 
 def setup_logging():
     logging.basicConfig(
@@ -127,7 +201,8 @@ async def api_download(
     max_size: Optional[float] = 0,
     output_dir: Optional[str] = "downloads",
     rename_pattern: Optional[str] = "{id}",
-    background_tasks: BackgroundTasks = None
+    background_tasks: BackgroundTasks = None,
+    current_user: User = Depends(get_current_user)  # Add authentication
 ):
     """
     Download videos from Loom URLs
@@ -249,6 +324,22 @@ async def get_api_docs():
             "rename_pattern": "{id}"
         }
     }
+
+# Add login endpoint
+@app.post("/token")
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate_user(users_db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 def format_time(seconds: int) -> str:
     """Format seconds into human readable time."""

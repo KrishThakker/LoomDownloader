@@ -8,6 +8,7 @@ import json
 import requests
 from typing import List
 import re
+from requests.auth import HTTPBasicAuth
 
 # Constants
 THEME_COLORS = {
@@ -63,6 +64,34 @@ def format_file_size(size_bytes: float) -> str:
         size_bytes /= 1024
     return f"{size_bytes:.1f} TB"
 
+# Add authentication functions
+def login(username: str, password: str) -> bool:
+    """Authenticate user and store token in session state"""
+    try:
+        response = requests.post(
+            "http://localhost:8000/token",
+            data={"username": username, "password": password}
+        )
+        if response.status_code == 200:
+            token_data = response.json()
+            st.session_state["token"] = token_data["access_token"]
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Login error: {str(e)}")
+        return False
+
+def check_authentication():
+    """Check if user is authenticated"""
+    if "token" not in st.session_state:
+        return False
+    return True
+
+def logout():
+    """Clear authentication token"""
+    if "token" in st.session_state:
+        del st.session_state["token"]
+
 def main():
     # Load saved settings
     settings = load_settings()
@@ -74,6 +103,22 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+
+    # Authentication check
+    if not check_authentication():
+        st.title("🔐 Login")
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submit = st.form_submit_button("Login")
+            
+            if submit:
+                if login(username, password):
+                    st.success("Login successful!")
+                    st.experimental_rerun()
+                else:
+                    st.error("Invalid username or password")
+        return
 
     # Initialize session state
     if 'theme' not in st.session_state:
@@ -180,6 +225,11 @@ def main():
             ### ❓ Need Help?
             [Documentation](https://github.com/yourusername/loom-downloader)
         """)
+
+        # Add logout button to sidebar
+        if st.button("Logout"):
+            logout()
+            st.experimental_rerun()
 
     setup_logging()
 
@@ -290,13 +340,14 @@ def main():
 
                 try:
                     response = requests.post(
-                        'http://localhost:8000/api/download',
+                        'http://localhost:8000/api/v1/download',
                         json={
                             'urls': urls,
                             'max_size': float(max_size),
                             'output_dir': output_dir,
                             'rename_pattern': rename_pattern
-                        }
+                        },
+                        headers={"Authorization": f"Bearer {st.session_state['token']}"}
                     )
 
                     if response.status_code == 200:
