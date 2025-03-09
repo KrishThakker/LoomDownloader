@@ -11,7 +11,6 @@ import PySimpleGUI as sg
 import threading
 import requests
 import uvicorn
-from queue import Queue
 import time
 
 # Import the download functionality
@@ -139,6 +138,7 @@ async def start_download(request: DownloadRequest, background_tasks: BackgroundT
         request.output_dir
     )
     
+    logging.info(f"Download started: {download_id} with {len(request.urls)} URLs.")
     return {"download_id": download_id}
 
 @app.get("/api/status/{download_id}")
