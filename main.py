@@ -38,6 +38,11 @@ import psutil
 from pathlib import Path
 import shutil
 import tempfile
+from cachetools import TTLCache, LRUCache
+from prometheus_client import Counter, Histogram, start_http_server
+import functools
+from typing import Callable
+import traceback
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -731,20 +736,35 @@ download_manager = DownloadManager()
 # Add health check endpoint
 @app.get("/health")
 async def health_check():
-    """Check system health"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc),
-        "active_downloads": len(download_manager.active_downloads),
-        "system_info": {
-            "memory_usage": psutil.Process().memory_info().rss / 1024 / 1024,
-            "cpu_usage": psutil.cpu_percent(),
-            "disk_usage": psutil.disk_usage('/').percent
+    """Detailed health check endpoint"""
+    try:
+        memory = psutil.Process().memory_info()
+        disk = psutil.disk_usage('/')
+        return {
+            "status": "healthy",
+            "timestamp": datetime.now(timezone.utc),
+            "version": "1.0.0",
+            "system": {
+                "cpu_percent": psutil.cpu_percent(),
+                "memory_used": memory.rss / 1024 / 1024,  # MB
+                "memory_percent": psutil.virtual_memory().percent,
+                "disk_free": disk.free / 1024 / 1024 / 1024,  # GB
+                "disk_percent": disk.percent
+            },
+            "application": {
+                "active_downloads": len(active_downloads),
+                "cached_urls": len(cache_manager.url_cache),
+                "cached_files": len(cache_manager.download_cache),
+                "uptime": time.time() - startup_time
+            }
         }
-    }
+    except Exception as e:
+        logging.error(f"Health check error: {e}")
+        raise HTTPException(status_code=500, detail="Health check failed")
 
-# Update download endpoint
+# Update download endpoint with caching and metrics
 @app.post("/api/v1/download")
+@track_errors
 async def api_download(
     request: Request,
     urls: List[str],
@@ -755,370 +775,133 @@ async def api_download(
     current_user: User = Depends(get_current_user),
     api_key: str = Depends(api_key_header)
 ):
-    """Download videos with enhanced security and monitoring"""
-    try:
-        # Validate request size and number of URLs
-        if len(urls) > SecurityConfig.MAX_URLS_PER_REQUEST:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Maximum {SecurityConfig.MAX_URLS_PER_REQUEST} URLs allowed per request"
-            )
-
-        # Validate each URL
-        invalid_urls = [url for url in urls if not validate_url(url)]
-        if invalid_urls:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid URLs detected: {invalid_urls}"
-            )
-
-        # Check concurrent downloads
-        user_downloads = sum(
-            1 for status in active_downloads.values()
-            if status.status not in {"Completed", "Failed", "Cancelled"}
-        )
-        if user_downloads >= SecurityConfig.MAX_CONCURRENT_DOWNLOADS:
-            raise HTTPException(
-                status_code=429,
-                detail="Maximum concurrent downloads reached"
-            )
-
-        # Set download timeout
-        download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        background_tasks.add_task(
-            download_manager.start_download,
-            download_id,
-            urls,
-            max_size=max_size,
-            output_dir=output_dir,
-            rename_pattern=rename_pattern
-        )
-        
-        logging.info(f"API Download started: {download_id} with {len(urls)} URLs")
-        
-        return {
-            "status": "success",
-            "download_id": download_id,
-            "message": "Download started"
-        }
-        
-    except Exception as e:
-        logging.error(f"Download error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/downloads")
-async def list_downloads():
-    """List all active downloads"""
-    try:
-        return {
-            "downloads": [
-                {
-                    "id": download_id,
-                    "status": status.dict()
-                }
-                for download_id, status in active_downloads.items()
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/api/v1/download/{download_id}")
-async def get_download_status(download_id: str):
-    """Get status of a specific download"""
-    try:
-        if download_id not in active_downloads:
-            raise HTTPException(status_code=404, detail="Download not found")
-        
-        status = active_downloads[download_id]
-        return {
-            "id": download_id,
-            "status": status.dict(),
-            "details": {
-                "progress": ((status.completed + status.failed) / status.total * 100 
-                           if status.total > 0 else 0),
-                "completed_urls": status.completed,
-                "failed_urls": status.failed,
-                "total_urls": status.total,
-                "current_url": status.current_url,
-                "errors": status.errors
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.delete("/api/v1/download/{download_id}")
-async def cancel_download(download_id: str):
-    """Cancel a specific download"""
-    try:
-        if download_id not in active_downloads:
-            raise HTTPException(status_code=404, detail="Download not found")
-        
-        status = active_downloads[download_id]
-        status.status = "Cancelled"
-        
-        return {"status": "success", "message": f"Download {download_id} cancelled"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Add API documentation info
-@app.get("/api/v1/docs")
-async def get_api_docs():
-    """Get API documentation"""
-    return {
-        "endpoints": {
-            "POST /api/v1/download": "Start a new download",
-            "GET /api/v1/downloads": "List all downloads",
-            "GET /api/v1/download/{download_id}": "Get download status",
-            "DELETE /api/v1/download/{download_id}": "Cancel download"
-        },
-        "example_request": {
-            "urls": ["https://www.loom.com/share/example-id"],
-            "max_size": 100,
-            "output_dir": "downloads",
-            "rename_pattern": "{id}"
-        }
-    }
-
-# Add rate limiting
-class RateLimiter:
-    def __init__(self):
-        self.requests = {}
-        self.login_attempts = {}
-        self.locked_accounts = {}
-
-    def is_rate_limited(self, ip: str, endpoint: str) -> bool:
-        now = datetime.now()
-        key = f"{ip}:{endpoint}"
-        
-        if key in self.requests:
-            requests = [t for t in self.requests[key] if now - t < timedelta(minutes=1)]
-            self.requests[key] = requests
-            if len(requests) >= 60:  # 60 requests per minute
-                return True
-        
-        if key not in self.requests:
-            self.requests[key] = []
-        self.requests[key].append(now)
-        return False
-
-    def record_login_attempt(self, username: str, success: bool):
-        now = datetime.now()
-        
-        if username in self.locked_accounts:
-            if now - self.locked_accounts[username] < timedelta(minutes=SecurityConfig.LOCKOUT_DURATION):
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Account locked. Try again in {SecurityConfig.LOCKOUT_DURATION} minutes."
-                )
-            del self.locked_accounts[username]
-        
-        if not success:
-            if username not in self.login_attempts:
-                self.login_attempts[username] = 1
-            else:
-                self.login_attempts[username] += 1
-                
-            if self.login_attempts[username] >= SecurityConfig.MAX_LOGIN_ATTEMPTS:
-                self.locked_accounts[username] = now
-                self.login_attempts[username] = 0
-                raise HTTPException(
-                    status_code=429,
-                    detail=f"Too many failed attempts. Account locked for {SecurityConfig.LOCKOUT_DURATION} minutes."
-                )
-        else:
-            if username in self.login_attempts:
-                del self.login_attempts[username]
-
-rate_limiter = RateLimiter()
-
-# Security utility functions
-def get_password_hash(password: str, salt: bytes = None) -> tuple[str, str]:
-    if salt is None:
-        salt = bcrypt.gensalt()
-    
-    # Add pepper to password
-    peppered = password + SecurityConfig.PEPPER
-    
-    # Hash with salt
-    hashed = pwd_context.hash(peppered + salt.decode())
-    return hashed, salt.decode()
-
-def verify_password(plain_password: str, hashed_password: str, salt: str) -> bool:
-    peppered = plain_password + SecurityConfig.PEPPER
-    return pwd_context.verify(peppered + salt, hashed_password)
-
-def format_time(seconds: int) -> str:
-    """Format seconds into human readable time."""
-    if seconds < 60:
-        return f"{seconds}s"
-    elif seconds < 3600:
-        return f"{seconds//60}m {seconds%60}s"
-    else:
-        return f"{seconds//3600}h {(seconds%3600)//60}m"
-
-def create_gui():
-    """Create the GUI with enhanced styling and features."""
-    sg.theme(WINDOW_THEME)
-
-    layout = [
-        [sg.Text('🎥 Loom Video Downloader', font=('Helvetica', 20), pad=(0, 10))],
-        [sg.Text('Enter URLs (one per line):', font=('Helvetica', 10))],
-        [sg.Multiline(size=(60, 10), key='urls', font=('Helvetica', 10))],
-        [
-            sg.Frame('Settings', [
-                [
-                    sg.Text('Max Size (MB):', font=('Helvetica', 10)),
-                    sg.Input('0', size=(10, 1), key='max_size'),
-                    sg.Text('Output Directory:', font=('Helvetica', 10)),
-                    sg.Input('downloads', size=(20, 1), key='output_dir'),
-                    sg.FolderBrowse()
-                ],
-                [
-                    sg.Text('Rename Pattern:', font=('Helvetica', 10)),
-                    sg.Input('{id}', size=(20, 1), key='rename_pattern'),
-                    sg.Checkbox('Skip Existing', key='skip_existing', default=True)
-                ]
-            ])
-        ],
-        [sg.Button('Download', size=(20, 1), button_color=('white', '#FF4B4B'))],
-        [sg.ProgressBar(100, orientation='h', size=(50, 20), key='progress')],
-        [sg.Text('Status:', font=('Helvetica', 10, 'bold')), sg.Text('', key='status', size=(50, 1))],
-        [sg.Text('Speed:', font=('Helvetica', 10, 'bold')), sg.Text('', key='speed', size=(20, 1))],
-        [sg.Text('ETA:', font=('Helvetica', 10, 'bold')), sg.Text('', key='eta', size=(20, 1))],
-        [sg.Text('Current URL:', font=('Helvetica', 10, 'bold')), sg.Text('', key='current_url', size=(50, 1))],
-        [sg.Multiline(size=(60, 5), key='summary', disabled=True, visible=False)]
-    ]
-
-    return sg.Window(
-        'Loom Video Downloader',
-        layout,
-        finalize=True,
-        resizable=True,
-        return_keyboard_events=True
-    )
-
-def monitor_download(window, download_id):
-    """Monitor download progress with enhanced feedback."""
-    start_time = time.time()
-    
-    while True:
+    """Download videos with enhanced caching and monitoring"""
+    with Metrics.request_duration.time():
         try:
-            response = requests.get(f'http://localhost:{DEFAULT_PORT}/api/status/{download_id}')
-            if response.status_code == 200:
-                status = response.json()
-                progress = ((status['completed'] + status['failed']) / status['total']) * 100
-                elapsed_time = time.time() - start_time
-                
-                # Calculate speed and ETA
-                speed = status['completed'] / elapsed_time if elapsed_time > 0 else 0
-                remaining = status['total'] - (status['completed'] + status['failed'])
-                eta = int(remaining / speed) if speed > 0 else 0
-                
-                window.write_event_value('-PROGRESS-', {
-                    'progress': progress,
-                    'status': status['status'],
-                    'current_url': status['current_url'],
-                    'completed': status['completed'],
-                    'failed': status['failed'],
-                    'total': status['total'],
-                    'speed': speed,
-                    'eta': eta
-                })
-                
-                if status['status'] == 'Completed' or status['status'].startswith('Failed'):
-                    break
-                    
-            else:
-                window.write_event_value('-ERROR-', 'Failed to get download status')
-                break
-                
-        except Exception as e:
-            logging.error(f"Error monitoring download: {e}")
-            window.write_event_value('-ERROR-', str(e))
-            break
+            Metrics.downloads_total.inc()
+            Metrics.active_downloads.inc()
             
-        time.sleep(1)
-
-def main():
-    window = create_gui()
-    
-    # Start FastAPI in a separate thread
-    api_thread = threading.Thread(
-        target=uvicorn.run,
-        args=(app,),
-        kwargs={'host': DEFAULT_HOST, 'port': DEFAULT_PORT, 'log_level': 'error'},
-        daemon=True
-    )
-    api_thread.start()
-
-    while True:
-        event, values = window.read(timeout=100)
-
-        if event == sg.WIN_CLOSED:
-            break
-
-        if event == 'Download':
-            urls = values['urls'].strip().split('\n')
-            urls = [url.strip() for url in urls if url.strip()]
-            
-            if not urls:
-                sg.popup_error('Please enter at least one URL')
-                continue
-
-            try:
-                response = requests.post(
-                    f'http://localhost:{DEFAULT_PORT}/api/download',
-                    json={
-                        'urls': urls,
-                        'max_size': float(values['max_size']),
-                        'output_dir': values['output_dir'],
-                        'rename_pattern': values['rename_pattern']
-                    }
+            # Validate request
+            if len(urls) > SecurityConfig.MAX_URLS_PER_REQUEST:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Maximum {SecurityConfig.MAX_URLS_PER_REQUEST} URLs allowed"
                 )
-                
-                if response.status_code == 200:
-                    download_id = response.json()['download_id']
-                    
-                    # Reset progress elements
-                    for key in ['progress', 'status', 'speed', 'eta', 'current_url']:
-                        window[key].update('')
-                    window['summary'].update(visible=False)
-                    
-                    # Start monitoring in a separate thread
-                    monitor_thread = threading.Thread(
-                        target=monitor_download,
-                        args=(window, download_id),
-                        daemon=True
-                    )
-                    monitor_thread.start()
+
+            download_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Check cache for each URL
+            cached_files = []
+            download_urls = []
+            
+            for url in urls:
+                video_id = extract_id(url)
+                cached_file = await cache_manager.get_cached_file(video_id)
+                if cached_file and cached_file.exists():
+                    cached_files.append((url, cached_file))
                 else:
-                    sg.popup_error('Failed to start download: Server error')
-            except Exception as e:
-                sg.popup_error(f'Error starting download: {e}')
+                    download_urls.append(url)
 
-        elif event == '-PROGRESS-':
-            # Update GUI with progress information
-            progress_data = values[event]
-            window['progress'].update(progress_data['progress'])
-            window['status'].update(progress_data['status'])
-            window['current_url'].update(progress_data['current_url'] or '')
-            window['speed'].update(f"{progress_data['speed']:.1f} videos/min")
-            window['eta'].update(format_time(progress_data['eta']))
-            
-            if progress_data['status'] == 'Completed':
-                summary = (
-                    f"Download Complete!\n\n"
-                    f"✅ Successfully downloaded: {progress_data['completed']} videos\n"
-                    f"❌ Failed downloads: {progress_data['failed']} videos\n"
-                    f"📁 Total processed: {progress_data['total']} videos\n"
-                    f"⏱️ Total time: {format_time(int(progress_data['eta']))}"
+            # Start new downloads
+            if download_urls:
+                background_tasks.add_task(
+                    download_manager.start_download,
+                    download_id,
+                    download_urls,
+                    max_size=max_size,
+                    output_dir=output_dir,
+                    rename_pattern=rename_pattern
                 )
-                window['summary'].update(summary, visible=True)
 
-        elif event == '-ERROR-':
-            sg.popup_error(f'Error: {values[event]}')
+            return {
+                "status": "success",
+                "download_id": download_id,
+                "cached_files": len(cached_files),
+                "new_downloads": len(download_urls),
+                "message": "Download started"
+            }
+            
+        except Exception as e:
+            Metrics.download_errors.inc()
+            raise
+        finally:
+            Metrics.active_downloads.dec()
 
-    window.close()
+# Add metrics endpoint
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(content=generate_latest())
+
+# Update startup event
+startup_time = time.time()
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    AppConfig.initialize()
+    # Start Prometheus metrics server
+    start_http_server(8000)
+
+# Add these imports
+from cachetools import TTLCache, LRUCache
+from prometheus_client import Counter, Histogram, start_http_server
+import functools
+from typing import Callable
+import traceback
+
+# Add metrics
+class Metrics:
+    downloads_total = Counter('downloads_total', 'Total number of downloads')
+    download_errors = Counter('download_errors', 'Total number of download errors')
+    download_duration = Histogram('download_duration_seconds', 'Time spent downloading')
+    active_downloads = Counter('active_downloads', 'Currently active downloads')
+    bytes_downloaded = Counter('bytes_downloaded_total', 'Total bytes downloaded')
+    request_duration = Histogram('request_duration_seconds', 'Request duration')
+
+# Add caching
+class CacheManager:
+    def __init__(self):
+        self.url_cache = TTLCache(maxsize=1000, ttl=3600)  # 1 hour TTL
+        self.download_cache = LRUCache(maxsize=100)  # LRU cache for downloaded files
+        
+    async def get_cached_url(self, video_id: str) -> Optional[str]:
+        return self.url_cache.get(video_id)
+        
+    async def cache_url(self, video_id: str, url: str) -> None:
+        self.url_cache[video_id] = url
+        
+    async def get_cached_file(self, video_id: str) -> Optional[Path]:
+        return self.download_cache.get(video_id)
+        
+    async def cache_file(self, video_id: str, file_path: Path) -> None:
+        self.download_cache[video_id] = file_path
+
+cache_manager = CacheManager()
+
+# Add error tracking decorator
+def track_errors(func: Callable):
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            error_id = str(uuid.uuid4())
+            error_details = {
+                'error_id': error_id,
+                'timestamp': datetime.now(timezone.utc),
+                'function': func.__name__,
+                'args': str(args),
+                'kwargs': str(kwargs),
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }
+            logging.error(f"Error {error_id}: {error_details}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Internal error (ID: {error_id})"
+            )
+    return wrapper
 
 # Add download timeout monitor
 async def monitor_download_timeout(download_id: str, timeout: int):
