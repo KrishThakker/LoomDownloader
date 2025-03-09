@@ -13,10 +13,15 @@ import requests
 import uvicorn
 import time
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from fastapi import Depends
+import secrets
+import hashlib
+import bcrypt
+from enum import Enum
+from fastapi import Request
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -27,12 +32,23 @@ DEFAULT_PORT = 8000
 DEFAULT_HOST = '0.0.0.0'
 
 # Security constants
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")  # Change in production
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
+class SecurityConfig:
+    SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_urlsafe(32))
+    ALGORITHM = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES = 30
+    REFRESH_TOKEN_EXPIRE_DAYS = 7
+    MIN_PASSWORD_LENGTH = 8
+    MAX_LOGIN_ATTEMPTS = 5
+    LOCKOUT_DURATION = 15  # minutes
+    PEPPER = os.getenv("PEPPER", secrets.token_hex(16))
 
 # Password hashing
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__rounds=12  # Increase work factor
+)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(
@@ -85,12 +101,21 @@ class DownloadStatus(BaseModel):
 active_downloads = {}
 
 # User model
+class UserRole(str, Enum):
+    ADMIN = "admin"
+    USER = "user"
+
 class User(BaseModel):
     username: str
-    disabled: Optional[bool] = None
+    email: Optional[str] = None
+    disabled: bool = False
+    role: UserRole = UserRole.USER
 
 class UserInDB(User):
     hashed_password: str
+    salt: str
+    last_login: Optional[datetime] = None
+    failed_attempts: int = 0
 
 # Mock user database - Replace with real database in production
 users_db = {
@@ -124,7 +149,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     else:
         expire = datetime.utcnow() + timedelta(minutes=15)
     to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    encoded_jwt = jwt.encode(to_encode, SecurityConfig.SECRET_KEY, algorithm=SecurityConfig.ALGORITHM)
     return encoded_jwt
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
@@ -134,7 +159,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(token, SecurityConfig.SECRET_KEY, algorithms=[SecurityConfig.ALGORITHM])
         username: str = payload.get("sub")
         if username is None:
             raise credentials_exception
@@ -325,21 +350,173 @@ async def get_api_docs():
         }
     }
 
-# Add login endpoint
-@app.post("/token")
-async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    user = authenticate_user(users_db, form_data.username, form_data.password)
-    if not user:
+# Add rate limiting
+class RateLimiter:
+    def __init__(self):
+        self.requests = {}
+        self.login_attempts = {}
+        self.locked_accounts = {}
+
+    def is_rate_limited(self, ip: str, endpoint: str) -> bool:
+        now = datetime.now()
+        key = f"{ip}:{endpoint}"
+        
+        if key in self.requests:
+            requests = [t for t in self.requests[key] if now - t < timedelta(minutes=1)]
+            self.requests[key] = requests
+            if len(requests) >= 60:  # 60 requests per minute
+                return True
+        
+        if key not in self.requests:
+            self.requests[key] = []
+        self.requests[key].append(now)
+        return False
+
+    def record_login_attempt(self, username: str, success: bool):
+        now = datetime.now()
+        
+        if username in self.locked_accounts:
+            if now - self.locked_accounts[username] < timedelta(minutes=SecurityConfig.LOCKOUT_DURATION):
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Account locked. Try again in {SecurityConfig.LOCKOUT_DURATION} minutes."
+                )
+            del self.locked_accounts[username]
+        
+        if not success:
+            if username not in self.login_attempts:
+                self.login_attempts[username] = 1
+            else:
+                self.login_attempts[username] += 1
+                
+            if self.login_attempts[username] >= SecurityConfig.MAX_LOGIN_ATTEMPTS:
+                self.locked_accounts[username] = now
+                self.login_attempts[username] = 0
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Too many failed attempts. Account locked for {SecurityConfig.LOCKOUT_DURATION} minutes."
+                )
+        else:
+            if username in self.login_attempts:
+                del self.login_attempts[username]
+
+rate_limiter = RateLimiter()
+
+# Security utility functions
+def get_password_hash(password: str, salt: bytes = None) -> tuple[str, str]:
+    if salt is None:
+        salt = bcrypt.gensalt()
+    
+    # Add pepper to password
+    peppered = password + SecurityConfig.PEPPER
+    
+    # Hash with salt
+    hashed = pwd_context.hash(peppered + salt.decode())
+    return hashed, salt.decode()
+
+def verify_password(plain_password: str, hashed_password: str, salt: str) -> bool:
+    peppered = plain_password + SecurityConfig.PEPPER
+    return pwd_context.verify(peppered + salt, hashed_password)
+
+# Update the login endpoint
+@app.post("/token", response_model=Token)
+async def login(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    request: Request = None
+):
+    if rate_limiter.is_rate_limited(request.client.host, "login"):
         raise HTTPException(
-            status_code=401,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=429,
+            detail="Too many requests. Please try again later."
         )
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.username}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
+
+    try:
+        user = authenticate_user(users_db, form_data.username, form_data.password)
+        if not user:
+            rate_limiter.record_login_attempt(form_data.username, False)
+            raise HTTPException(
+                status_code=401,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        rate_limiter.record_login_attempt(form_data.username, True)
+        
+        # Generate tokens
+        access_token_expires = timedelta(minutes=SecurityConfig.ACCESS_TOKEN_EXPIRE_MINUTES)
+        refresh_token_expires = timedelta(days=SecurityConfig.REFRESH_TOKEN_EXPIRE_DAYS)
+        
+        access_token = create_access_token(
+            data={"sub": user.username, "role": user.role},
+            expires_delta=access_token_expires
+        )
+        
+        refresh_token = create_access_token(
+            data={"sub": user.username, "refresh": True},
+            expires_delta=refresh_token_expires
+        )
+
+        # Update last login
+        users_db[user.username].last_login = datetime.now()
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+        
+    except Exception as e:
+        logging.error(f"Login error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+# Add refresh token endpoint
+@app.post("/token/refresh", response_model=Token)
+async def refresh_token(
+    current_token: str = Depends(oauth2_scheme),
+    request: Request = None
+):
+    if rate_limiter.is_rate_limited(request.client.host, "refresh"):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many requests. Please try again later."
+        )
+
+    try:
+        payload = jwt.decode(
+            current_token, SecurityConfig.SECRET_KEY, algorithms=[SecurityConfig.ALGORITHM]
+        )
+        username: str = payload.get("sub")
+        is_refresh = payload.get("refresh", False)
+        
+        if not is_refresh:
+            raise HTTPException(status_code=400, detail="Not a refresh token")
+            
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+            
+        user = get_user(users_db, username)
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+            
+        # Generate new tokens
+        access_token = create_access_token(
+            data={"sub": user.username, "role": user.role},
+            expires_delta=timedelta(minutes=SecurityConfig.ACCESS_TOKEN_EXPIRE_MINUTES)
+        )
+        
+        refresh_token = create_access_token(
+            data={"sub": user.username, "refresh": True},
+            expires_delta=timedelta(days=SecurityConfig.REFRESH_TOKEN_EXPIRE_DAYS)
+        )
+        
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer"
+        }
+        
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
 
 def format_time(seconds: int) -> str:
     """Format seconds into human readable time."""
