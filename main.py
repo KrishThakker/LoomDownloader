@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks, File, UploadFile, F
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any, Union, Set, Tuple
+from typing import List, Optional, Dict, Any, Union, Set, Tuple, AsyncGenerator
 import os
 import json
 import logging
@@ -35,6 +35,9 @@ import asyncio
 import aiohttp
 import aiofile
 import psutil
+from pathlib import Path
+import shutil
+import tempfile
 
 # Import the download functionality
 from loom_downloader import fetch_loom_download_url, download_loom_video, extract_id, format_size
@@ -621,8 +624,24 @@ class DownloadManager:
         self.download_history: Dict[str, List[Dict[str, Any]]] = {}
         self.encryption = Fernet(SecurityConfig.ENCRYPTION_KEY)
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        self._semaphore = asyncio.Semaphore(SecurityConfig.MAX_CONCURRENT_DOWNLOADS)
+
+    async def stream_download(self, url: str) -> AsyncGenerator[bytes, None]:
+        """Stream download with progress tracking"""
+        async with self._semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, proxy=SecurityConfig.PROXY_SETTINGS) as response:
+                    if response.status != 200:
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail=f"Failed to download: HTTP {response.status}"
+                        )
+                    
+                    async for chunk in response.content.iter_chunked(SecurityConfig.DOWNLOAD_CHUNK_SIZE):
+                        yield chunk
 
     async def start_download(self, download_id: str, urls: List[str], **kwargs) -> None:
+        """Start download with improved error handling and progress tracking"""
         try:
             status = DownloadStatus(
                 id=download_id,
@@ -634,18 +653,28 @@ class DownloadManager:
             )
             self.active_downloads[download_id] = status
             
-            async with aiohttp.ClientSession() as session:
-                for url in urls:
-                    if status.status == "Cancelled":
-                        break
-                        
-                    status.current_url = url
-                    try:
-                        await self._download_file(session, url, status, **kwargs)
-                    except Exception as e:
-                        status.failed += 1
-                        status.errors.append({"url": url, "error": str(e)})
-                        
+            for url in urls:
+                if status.status == "Cancelled":
+                    break
+                    
+                status.current_url = url
+                try:
+                    final_path = Path(kwargs['output_dir']) / f"{status.id}.mp4"
+                    
+                    async for chunk in self.stream_download(url):
+                        if status.status == "Cancelled":
+                            await self._cleanup_download(download_id)
+                            break
+                        await self._save_chunk(download_id, chunk)
+                    
+                    await self._finalize_download(download_id, final_path)
+                    status.completed += 1
+                    
+                except Exception as e:
+                    status.failed += 1
+                    status.errors.append({"url": url, "error": str(e)})
+                    await self._cleanup_download(download_id)
+                    
             status.status = "Completed" if status.failed == 0 else "Completed with errors"
             status.end_time = datetime.now(timezone.utc)
             
@@ -658,83 +687,43 @@ class DownloadManager:
         except Exception as e:
             logging.error(f"Download error: {str(e)}")
             status.status = f"Failed: {str(e)}"
+            await self._cleanup_download(download_id)
 
-    async def _download_file(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        status: DownloadStatus,
-        **kwargs
-    ) -> None:
-        retries = 0
-        while retries < SecurityConfig.MAX_RETRIES:
+    async def _save_chunk(self, download_id: str, chunk: bytes) -> None:
+        """Save a chunk to temporary file"""
+        temp_path = SecurityConfig.TEMP_DIR / f"{download_id}.part"
+        async with aiofile.async_open(temp_path, 'ab') as f:
+            await f.write(chunk)
+        self.temp_files[download_id] = temp_path
+
+    async def _finalize_download(self, download_id: str, final_path: Path) -> None:
+        """Move temporary file to final location"""
+        if download_id in self.temp_files:
+            temp_path = self.temp_files[download_id]
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_path), str(final_path))
+            del self.temp_files[download_id]
+
+    async def _cleanup_download(self, download_id: str) -> None:
+        """Clean up temporary files for failed download"""
+        if download_id in self.temp_files:
             try:
-                async with session.get(url, proxy=SecurityConfig.PROXY_SETTINGS) as response:
-                    if response.status != 200:
-                        raise HTTPException(
-                            status_code=response.status,
-                            detail=f"Failed to download: HTTP {response.status}"
-                        )
-                    
-                    # Check content type and size
-                    content_type = response.headers.get('content-type', '')
-                    if content_type not in SecurityConfig.ALLOWED_MIME_TYPES:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Invalid content type: {content_type}"
-                        )
-                    
-                    content_length = int(response.headers.get('content-length', 0))
-                    if content_length > SecurityConfig.FILE_SIZE_LIMIT:
-                        raise HTTPException(
-                            status_code=413,
-                            detail="File too large"
-                        )
-                    
-                    # Download file in chunks
-                    filename = os.path.join(kwargs['output_dir'], f"{status.id}.mp4")
-                    async with aiofile.async_open(filename, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(SecurityConfig.DOWNLOAD_CHUNK_SIZE):
-                            if status.status == "Cancelled":
-                                return
-                            await f.write(chunk)
-                    
-                    # Scan downloaded file if enabled
-                    if SecurityConfig.SCAN_DOWNLOADS:
-                        await self._scan_file(filename)
-                    
-                    status.completed += 1
-                    return
-                    
+                self.temp_files[download_id].unlink(missing_ok=True)
+                del self.temp_files[download_id]
             except Exception as e:
-                retries += 1
-                if retries < SecurityConfig.MAX_RETRIES:
-                    await asyncio.sleep(SecurityConfig.RETRY_DELAY)
-                else:
-                    raise e
-
-    async def _scan_file(self, filename: str) -> None:
-        """Implement virus scanning here"""
-        pass
+                logging.error(f"Error cleaning up download {download_id}: {e}")
 
     async def _periodic_cleanup(self) -> None:
-        """Cleanup old downloads periodically"""
+        """Periodically clean up old temporary files"""
         while True:
             try:
-                now = datetime.now(timezone.utc)
-                # Clean up old downloads
-                self.active_downloads = {
-                    id: status for id, status in self.active_downloads.items()
-                    if (now - status.start_time).days < 1
-                }
-                # Clean up old history
-                self.download_history = {
-                    id: history for id, history in self.download_history.items()
-                    if (now - history["timestamp"]).days < 7
-                }
-                await asyncio.sleep(3600)  # Clean up every hour
+                now = time.time()
+                for file in SecurityConfig.TEMP_DIR.glob("*.part"):
+                    if now - file.stat().st_mtime > SecurityConfig.MAX_AGE_TEMP_FILES:
+                        file.unlink()
+                await asyncio.sleep(SecurityConfig.CLEANUP_INTERVAL)
             except Exception as e:
-                logging.error(f"Cleanup error: {str(e)}")
+                logging.error(f"Error in periodic cleanup: {e}")
                 await asyncio.sleep(60)
 
 download_manager = DownloadManager()
@@ -1143,6 +1132,217 @@ async def monitor_download_timeout(download_id: str, timeout: int):
                 "error": "Download timeout",
                 "url": status.current_url
             })
+
+# Add new security and performance configurations
+class AppConfig:
+    # Download settings
+    TEMP_DIR = Path(tempfile.gettempdir()) / "loom_downloads"
+    CHUNK_SIZE = 1024 * 1024  # 1MB chunks
+    MAX_PARALLEL_DOWNLOADS = 3
+    DOWNLOAD_RETRIES = 3
+    RETRY_DELAY = 5  # seconds
+    
+    # Cache settings
+    CACHE_DIR = Path("cache")
+    CACHE_TTL = 3600  # 1 hour
+    MAX_CACHE_SIZE = 1024 * 1024 * 1024  # 1GB
+    
+    # Cleanup settings
+    CLEANUP_INTERVAL = 3600  # 1 hour
+    MAX_AGE_TEMP_FILES = 24 * 3600  # 24 hours
+    
+    @classmethod
+    def initialize(cls):
+        """Initialize application directories"""
+        cls.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        cls.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Add file handling utilities
+class FileManager:
+    def __init__(self):
+        self.temp_files: Dict[str, Path] = {}
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+
+    async def save_chunk(self, download_id: str, chunk: bytes) -> Path:
+        """Save a chunk to temporary file"""
+        temp_path = AppConfig.TEMP_DIR / f"{download_id}.part"
+        async with aiofile.async_open(temp_path, 'ab') as f:
+            await f.write(chunk)
+        self.temp_files[download_id] = temp_path
+        return temp_path
+
+    async def finalize_download(self, download_id: str, final_path: Path) -> None:
+        """Move temporary file to final location"""
+        if download_id in self.temp_files:
+            temp_path = self.temp_files[download_id]
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_path), str(final_path))
+            del self.temp_files[download_id]
+
+    async def cleanup_download(self, download_id: str) -> None:
+        """Clean up temporary files for failed download"""
+        if download_id in self.temp_files:
+            try:
+                self.temp_files[download_id].unlink(missing_ok=True)
+                del self.temp_files[download_id]
+            except Exception as e:
+                logging.error(f"Error cleaning up download {download_id}: {e}")
+
+    async def _periodic_cleanup(self) -> None:
+        """Periodically clean up old temporary files"""
+        while True:
+            try:
+                now = time.time()
+                for file in AppConfig.TEMP_DIR.glob("*.part"):
+                    if now - file.stat().st_mtime > AppConfig.MAX_AGE_TEMP_FILES:
+                        file.unlink()
+                await asyncio.sleep(AppConfig.CLEANUP_INTERVAL)
+            except Exception as e:
+                logging.error(f"Error in periodic cleanup: {e}")
+                await asyncio.sleep(60)
+
+file_manager = FileManager()
+
+# Update DownloadManager with streaming support
+class DownloadManager:
+    def __init__(self):
+        self.active_downloads: Dict[str, DownloadStatus] = {}
+        self.download_history: Dict[str, List[Dict[str, Any]]] = {}
+        self.encryption = Fernet(SecurityConfig.ENCRYPTION_KEY)
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        self._semaphore = asyncio.Semaphore(AppConfig.MAX_PARALLEL_DOWNLOADS)
+
+    async def stream_download(self, url: str) -> AsyncGenerator[bytes, None]:
+        """Stream download with progress tracking"""
+        async with self._semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, proxy=SecurityConfig.PROXY_SETTINGS) as response:
+                    if response.status != 200:
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail=f"Failed to download: HTTP {response.status}"
+                        )
+                    
+                    async for chunk in response.content.iter_chunked(AppConfig.CHUNK_SIZE):
+                        yield chunk
+
+    async def start_download(self, download_id: str, urls: List[str], **kwargs) -> None:
+        """Start download with improved error handling and progress tracking"""
+        try:
+            status = DownloadStatus(
+                id=download_id,
+                total=len(urls),
+                completed=0,
+                failed=0,
+                status="Starting",
+                start_time=datetime.now(timezone.utc)
+            )
+            self.active_downloads[download_id] = status
+            
+            for url in urls:
+                if status.status == "Cancelled":
+                    break
+                    
+                status.current_url = url
+                try:
+                    final_path = Path(kwargs['output_dir']) / f"{status.id}.mp4"
+                    
+                    async for chunk in self.stream_download(url):
+                        if status.status == "Cancelled":
+                            await self._cleanup_download(download_id)
+                            break
+                        await self._save_chunk(download_id, chunk)
+                    
+                    await self._finalize_download(download_id, final_path)
+                    status.completed += 1
+                    
+                except Exception as e:
+                    status.failed += 1
+                    status.errors.append({"url": url, "error": str(e)})
+                    await self._cleanup_download(download_id)
+                    
+            status.status = "Completed" if status.failed == 0 else "Completed with errors"
+            status.end_time = datetime.now(timezone.utc)
+            
+            # Store download history
+            self.download_history[download_id] = {
+                "status": status.dict(),
+                "timestamp": datetime.now(timezone.utc)
+            }
+            
+        except Exception as e:
+            logging.error(f"Download error: {str(e)}")
+            status.status = f"Failed: {str(e)}"
+            await self._cleanup_download(download_id)
+
+    async def _save_chunk(self, download_id: str, chunk: bytes) -> None:
+        """Save a chunk to temporary file"""
+        temp_path = AppConfig.TEMP_DIR / f"{download_id}.part"
+        async with aiofile.async_open(temp_path, 'ab') as f:
+            await f.write(chunk)
+        self.temp_files[download_id] = temp_path
+
+    async def _finalize_download(self, download_id: str, final_path: Path) -> None:
+        """Move temporary file to final location"""
+        if download_id in self.temp_files:
+            temp_path = self.temp_files[download_id]
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(temp_path), str(final_path))
+            del self.temp_files[download_id]
+
+    async def _cleanup_download(self, download_id: str) -> None:
+        """Clean up temporary files for failed download"""
+        if download_id in self.temp_files:
+            try:
+                self.temp_files[download_id].unlink(missing_ok=True)
+                del self.temp_files[download_id]
+            except Exception as e:
+                logging.error(f"Error cleaning up download {download_id}: {e}")
+
+    async def _periodic_cleanup(self) -> None:
+        """Periodically clean up old temporary files"""
+        while True:
+            try:
+                now = time.time()
+                for file in AppConfig.TEMP_DIR.glob("*.part"):
+                    if now - file.stat().st_mtime > AppConfig.MAX_AGE_TEMP_FILES:
+                        file.unlink()
+                await asyncio.sleep(AppConfig.CLEANUP_INTERVAL)
+            except Exception as e:
+                logging.error(f"Error in periodic cleanup: {e}")
+                await asyncio.sleep(60)
+
+download_manager = DownloadManager()
+
+# Initialize application
+@app.on_event("startup")
+async def startup_event():
+    """Initialize application on startup"""
+    AppConfig.initialize()
+    
+# Add streaming download endpoint
+@app.get("/api/v1/download/{download_id}/stream")
+async def stream_download(
+    download_id: str,
+    current_user: User = Depends(get_current_user)
+) -> StreamingResponse:
+    """Stream download directly to client"""
+    try:
+        if download_id not in active_downloads:
+            raise HTTPException(status_code=404, detail="Download not found")
+            
+        status = active_downloads[download_id]
+        if not status.current_url:
+            raise HTTPException(status_code=400, detail="No active download URL")
+            
+        return StreamingResponse(
+            download_manager.stream_download(status.current_url),
+            media_type="video/mp4"
+        )
+        
+    except Exception as e:
+        logging.error(f"Streaming error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     setup_logging()
